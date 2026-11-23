@@ -1,0 +1,81 @@
+# Builds MediaGrab.exe on Windows and tests it.
+# - Every change to main (and every pull request): check, build and self-test. The exe and
+#   screenshots of every window are kept as a download on the run's page ("Artifacts").
+# - Publishing a release on GitHub: the same, then MediaGrab.exe is attached to that release.
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Check the script and compile its C# code
+        shell: powershell
+        run: |
+          $path = (Resolve-Path src\MediaGrab.ps1).Path
+          $tokens = $null; $errors = $null
+          [void][Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+          if ($errors) { $errors | ForEach-Object { Write-Host "Line $($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
+          $text = Get-Content $path -Raw
+          if ($text -match '[^\x00-\x7F]') { Write-Host 'The script must be plain ASCII (Windows PowerShell reads it without a BOM).'; exit 1 }
+          $cs = [regex]::Match($text, "(?s)\`$UiCode = @'\r?\n(.*?)\r?\n'@").Groups[1].Value
+          if (-not $cs) { Write-Host 'C# code block not found'; exit 1 }
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition $cs
+          Write-Host 'The script parses and its C# code compiles.'
+
+      - name: Build MediaGrab.exe
+        shell: bash
+        run: ./build.sh
+
+      - name: Self-test, light mode (first start, downloads yt-dlp and ffmpeg)
+        shell: powershell
+        run: |
+          $env:MEDIAGRAB_THEME = 'light'
+          $env:MEDIAGRAB_SELFTEST = "$PWD\selftest\light"
+          New-Item $env:MEDIAGRAB_SELFTEST -ItemType Directory -Force | Out-Null
+          powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File src\MediaGrab.ps1
+          exit $LASTEXITCODE
+
+      - name: Self-test, dark mode (later start, only checks for updates)
+        shell: powershell
+        run: |
+          $env:MEDIAGRAB_THEME = 'dark'
+          $env:MEDIAGRAB_SELFTEST = "$PWD\selftest\dark"
+          New-Item $env:MEDIAGRAB_SELFTEST -ItemType Directory -Force | Out-Null
+          powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File src\MediaGrab.ps1
+          exit $LASTEXITCODE
+
+      - name: Keep the exe and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MediaGrab
+          path: |
+            MediaGrab.exe
+            selftest/**/*.png
+            selftest/**/result.txt
+
+      - name: Attach MediaGrab.exe to the release
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" MediaGrab.exe --clobber --repo "${{ github.repository }}"

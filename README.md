@@ -9,10 +9,11 @@ A small Windows tray app: press a keyboard shortcut while a YouTube video or Spo
 - **Trim** with a start and end time, choose the folder and the file name. Empty boxes use your defaults
 - **Spotify songs:** reads the title and artist from Spotify, finds the best match on YouTube Music by length, and lets you pick another match if needed
 - **Song info and cover art** saved inside the files
-- **Downloads window** with live progress and a download history; warns before downloading the same thing twice
+- **Downloads window** with progress bars and a download history; warns before downloading the same thing twice, and shows why a download failed
 - **Clipboard mode:** works with a copied YouTube or Spotify link
 - **Settings window** for every default, plus "Start with Windows"
-- **Self-contained:** downloads [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [ffmpeg](https://ffmpeg.org) on first run and keeps yt-dlp updated
+- **Modern look** with rounded controls; follows the Windows light or dark mode setting
+- **Self-contained:** downloads [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [ffmpeg](https://ffmpeg.org) once, on first run, and checks yt-dlp for updates at each start. Damaged or half-finished downloads of these tools are detected and fetched again
 
 ## Install
 
@@ -41,6 +42,16 @@ Requires Go 1.24 or newer:
 ```
 
 This produces `MediaGrab.exe` in the repository folder.
+
+## Automatic build and releases
+
+Every change to `main` is built and tested on Windows by GitHub Actions (`.github/workflows/build.yml`). The test downloads yt-dlp and ffmpeg, tries a download, and takes screenshots of every window in light and dark mode. The exe and screenshots can be downloaded from the run's page under **Artifacts**.
+
+To publish a new version:
+
+1. Change `$Version` at the top of `src/MediaGrab.ps1` and commit it.
+2. On GitHub, open **Releases**, then **Draft a new release**, type a new tag such as `v1.0.1`, and click **Publish release**.
+3. After a few minutes, `MediaGrab.exe` is attached to the release automatically.
 
 ## Notes
 
