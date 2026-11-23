@@ -18,6 +18,7 @@ public class Hotkey : NativeWindow {
     [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr h, int id, uint mod, uint vk);
     [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr h, int id);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, string l);
     public static void Hint(TextBox box, string text) { SendMessage(box.Handle, 0x1501, (IntPtr)1, text); }
     public event EventHandler Pressed;
@@ -25,11 +26,15 @@ public class Hotkey : NativeWindow {
         if (Handle == IntPtr.Zero) CreateHandle(new CreateParams());
         UnregisterHotKey(Handle, 1); return RegisterHotKey(Handle, 1, mod | 0x4000, vk);
     }
+    public void Unregister() { if (Handle != IntPtr.Zero) UnregisterHotKey(Handle, 1); }
     protected override void WndProc(ref Message m) { if (m.Msg == 0x312 && Pressed != null) Pressed(this, null); base.WndProc(ref m); }
 }
 
 // Drawing helpers shared by the controls below
 public static class MgUi {
+    public static float Scale = 1f;   // display scaling (1 = 100%, 1.5 = 150%)
+    public static float S(float v) { return v * Scale; }
+    public static int Px(float v) { return (int)Math.Round(v * Scale); }
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int val, int size);
     [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)] static extern int SetWindowTheme(IntPtr h, string app, string id);
     public static void DarkTitle(IntPtr h) { int on = 1; if (DwmSetWindowAttribute(h, 20, ref on, 4) != 0) DwmSetWindowAttribute(h, 19, ref on, 4); }
@@ -65,11 +70,12 @@ public class MgButton : Button {
         Graphics g = e.Graphics; Color under = MgUi.Under(this);
         g.Clear(under); g.SmoothingMode = SmoothingMode.AntiAlias;
         Color c = !Enabled ? MgUi.Mix(fill, under, 0.55) : (over ? hover : fill);
-        using (GraphicsPath p = MgUi.Round(new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f), Radius))
+        using (GraphicsPath p = MgUi.Round(new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f), MgUi.S(Radius)))
         using (SolidBrush b = new SolidBrush(c)) g.FillPath(b, p);
+        float i = MgUi.S(2.5f);
         if (Focused && ShowFocusCues)
-            using (GraphicsPath p = MgUi.Round(new RectangleF(2.5f, 2.5f, Width - 5.5f, Height - 5.5f), Math.Max(Radius - 2, 1)))
-            using (Pen pen = new Pen(MgUi.Mix(c, ForeColor, 0.5), 1.5f)) g.DrawPath(pen, p);
+            using (GraphicsPath p = MgUi.Round(new RectangleF(i, i, Width - 2 * i - 0.5f, Height - 2 * i - 0.5f), MgUi.S(Math.Max(Radius - 2, 1))))
+            using (Pen pen = new Pen(MgUi.Mix(c, ForeColor, 0.5), MgUi.S(1.5f))) g.DrawPath(pen, p);
         Color t = Enabled ? ForeColor : MgUi.Mix(ForeColor, c, 0.45);
         TextRenderer.DrawText(g, Text, Font, ClientRectangle, t, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
     }
@@ -83,17 +89,56 @@ public class MgField : Panel {
     public Color FocusColor { get { return focusColor; } set { focusColor = value; Invalidate(); } }
     public Color Fill { get { return Box.BackColor; } set { Box.BackColor = value; Invalidate(); } }
     public MgField() {
-        DoubleBuffered = true; ResizeRedraw = true; Padding = new Padding(10, 7, 10, 4); Height = 32; Cursor = Cursors.IBeam;
-        Box.BorderStyle = BorderStyle.None; Box.Dock = DockStyle.Fill; Controls.Add(Box);
+        DoubleBuffered = true; ResizeRedraw = true; Height = 32; Cursor = Cursors.IBeam;
+        Box.BorderStyle = BorderStyle.None; Controls.Add(Box);
+        Box.SizeChanged += delegate { PerformLayout(); };
         Box.GotFocus += delegate { Invalidate(); }; Box.LostFocus += delegate { Invalidate(); };
         Click += delegate { Box.Focus(); };
     }
+    protected override void OnLayout(LayoutEventArgs e) {   // text box centred vertically, with room on the sides
+        base.OnLayout(e);
+        int pad = MgUi.Px(10);
+        Box.SetBounds(pad, Math.Max(0, (Height - Box.Height) / 2), Math.Max(10, Width - 2 * pad), Box.Height);
+    }
     protected override void OnPaint(PaintEventArgs e) {
         Graphics g = e.Graphics; g.Clear(MgUi.Under(this)); g.SmoothingMode = SmoothingMode.AntiAlias;
-        bool f = Box.Focused;
-        using (GraphicsPath p = MgUi.Round(new RectangleF(0.75f, 0.75f, Width - 2f, Height - 2f), 7))
+        bool f = Box.Focused; float w = MgUi.S(f ? 1.5f : 1f);
+        using (GraphicsPath p = MgUi.Round(new RectangleF(w / 2, w / 2, Width - w - 0.5f, Height - w - 0.5f), MgUi.S(7)))
         using (SolidBrush b = new SolidBrush(Box.BackColor))
-        using (Pen pen = new Pen(f ? focusColor : border, f ? 1.5f : 1f)) { g.FillPath(b, p); g.DrawPath(pen, p); }
+        using (Pen pen = new Pen(f ? focusColor : border, w)) { g.FillPath(b, p); g.DrawPath(pen, p); }
+    }
+}
+
+// Shortcut box: click it, then press the keys you want (e.g. Ctrl+Shift+D)
+public class MgKeyField : MgField {
+    [DllImport("user32.dll")] static extern short GetKeyState(int key);
+    string value = "";
+    public string Prompt { get; set; }
+    public string Value { get { return value; } set { this.value = value ?? ""; if (!Box.Focused) Box.Text = this.value; } }
+    public MgKeyField() {
+        Prompt = "Press the new shortcut...";
+        Box.ReadOnly = true; Box.ShortcutsEnabled = false; Box.Cursor = Cursors.Hand; Cursor = Cursors.Hand;
+        Box.PreviewKeyDown += delegate(object s, PreviewKeyDownEventArgs e) {
+            bool plain = !e.Control && !e.Alt && !Win();
+            if (plain && (e.KeyCode == Keys.Tab || e.KeyCode == Keys.Enter || e.KeyCode == Keys.Escape)) return;
+            e.IsInputKey = true;   // keep keys like Alt+letter from moving focus
+        };
+        Box.KeyDown += OnKey;
+        Box.KeyUp += delegate { if (Box.Focused && Box.Text.EndsWith("+")) Box.Text = Prompt; };
+        Box.GotFocus += delegate { Box.Text = Prompt; };
+        Box.LostFocus += delegate { Box.Text = value; };
+    }
+    static bool Win() { return (GetKeyState(0x5B) & 0x8000) != 0 || (GetKeyState(0x5C) & 0x8000) != 0; }
+    void OnKey(object s, KeyEventArgs e) {
+        Keys k = e.KeyCode; bool win = Win();
+        bool plain = !e.Control && !e.Alt && !win;
+        if (plain && (k == Keys.Tab || k == Keys.Enter || k == Keys.Escape)) return;
+        e.Handled = true; e.SuppressKeyPress = true;
+        string mods = (e.Control ? "Ctrl+" : "") + (e.Alt ? "Alt+" : "") + (e.Shift ? "Shift+" : "") + (win ? "Win+" : "");
+        if (k == Keys.ControlKey || k == Keys.ShiftKey || k == Keys.Menu || k == Keys.LWin || k == Keys.RWin) { Box.Text = mods; return; }
+        if (plain) { Box.Text = "Also hold Ctrl, Alt or Win"; return; }
+        string name = (k >= Keys.D0 && k <= Keys.D9) ? ((int)(k - Keys.D0)).ToString() : k.ToString();
+        value = mods + name; Box.Text = value;
     }
 }
 
@@ -115,10 +160,11 @@ public class MgSegments : Control {
         set { int i = Array.IndexOf(items, value); Pick(i >= 0 ? i : (items.Length > 0 ? 0 : -1)); }
     }
     void Pick(int i) { sel = i; Invalidate(); if (Changed != null) Changed(this, EventArgs.Empty); }
-    RectangleF Cell(int i) { float w = (Width - 6f) / items.Length; return new RectangleF(3 + i * w, 3, w, Height - 6); }
+    RectangleF Cell(int i) { float m = MgUi.S(3), w = (Width - 2 * m) / items.Length; return new RectangleF(m + i * w, m, w, Height - 2 * m); }
     int At(Point p) {
         if (items.Length == 0) return -1;
-        int i = (int)((p.X - 3) * items.Length / Math.Max(1f, Width - 6f));
+        float m = MgUi.S(3);
+        int i = (int)((p.X - m) * items.Length / Math.Max(1f, Width - 2 * m));
         return Math.Max(0, Math.Min(items.Length - 1, i));
     }
     protected override void OnMouseMove(MouseEventArgs e) { int h = At(e.Location); if (h != hot) { hot = h; Invalidate(); } base.OnMouseMove(e); }
@@ -127,12 +173,12 @@ public class MgSegments : Control {
     protected override void OnEnabledChanged(EventArgs e) { Invalidate(); base.OnEnabledChanged(e); }
     protected override void OnPaint(PaintEventArgs e) {
         Graphics g = e.Graphics; g.Clear(MgUi.Under(this)); g.SmoothingMode = SmoothingMode.AntiAlias;
-        using (GraphicsPath p = MgUi.Round(new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f), 8))
+        using (GraphicsPath p = MgUi.Round(new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f), MgUi.S(8)))
         using (SolidBrush b = new SolidBrush(Track)) g.FillPath(b, p);
         for (int i = 0; i < items.Length; i++) {
             RectangleF r = Cell(i); Color tc = Sub;
             if (i == sel) {
-                using (GraphicsPath p = MgUi.Round(r, 6))
+                using (GraphicsPath p = MgUi.Round(r, MgUi.S(6)))
                 using (SolidBrush b = new SolidBrush(Enabled ? Pill : MgUi.Mix(Pill, Track, 0.6))) g.FillPath(b, p);
                 tc = PillText;
             } else if (i == hot && Enabled) tc = ForeColor;
@@ -163,7 +209,7 @@ public class MgThumb : Control {
     protected override void OnPaint(PaintEventArgs e) {
         Graphics g = e.Graphics; g.Clear(MgUi.Under(this));
         g.SmoothingMode = SmoothingMode.AntiAlias; g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-        using (GraphicsPath p = MgUi.Round(new RectangleF(0, 0, Width - 0.5f, Height - 0.5f), 10)) {
+        using (GraphicsPath p = MgUi.Round(new RectangleF(0, 0, Width - 0.5f, Height - 0.5f), MgUi.S(10))) {
             using (SolidBrush b = new SolidBrush(Empty)) g.FillPath(b, p);
             if (img == null || img.Width == 0 || img.Height == 0) return;
             float sx = (float)Width / img.Width, sy = (float)Height / img.Height;
@@ -172,7 +218,7 @@ public class MgThumb : Control {
             using (TextureBrush tb = new TextureBrush(img, WrapMode.Clamp)) {
                 tb.TranslateTransform(x, y); tb.ScaleTransform(s, s);
                 if (Crop) g.FillPath(tb, p);
-                else using (GraphicsPath q = MgUi.Round(new RectangleF(x, y, w, h), 8)) g.FillPath(tb, q);
+                else using (GraphicsPath q = MgUi.Round(new RectangleF(x, y, w, h), MgUi.S(8))) g.FillPath(tb, q);
             }
         }
     }
@@ -190,6 +236,10 @@ public class MgList : ListView {
     public Color Good { get; set; }
     public Color Bad { get; set; }
     public string EmptyText { get; set; }
+    public int RowHeight {
+        get { return SmallImageList.ImageSize.Height; }
+        set { SmallImageList.ImageSize = new Size(1, Math.Max(16, Math.Min(256, value))); }
+    }
     public MgList() {
         OwnerDraw = true; DoubleBuffered = true; View = View.Details; FullRowSelect = true; MultiSelect = false;
         HeaderStyle = ColumnHeaderStyle.Nonclickable; BorderStyle = BorderStyle.None;
@@ -206,7 +256,7 @@ public class MgList : ListView {
     protected override void OnDrawColumnHeader(DrawListViewColumnHeaderEventArgs e) {
         Graphics g = e.Graphics;
         using (SolidBrush b = new SolidBrush(Head)) g.FillRectangle(b, e.Bounds);
-        Rectangle r = new Rectangle(e.Bounds.X + 12, e.Bounds.Y, Math.Max(0, e.Bounds.Width - 12), e.Bounds.Height);
+        Rectangle r = new Rectangle(e.Bounds.X + MgUi.Px(12), e.Bounds.Y, Math.Max(0, e.Bounds.Width - MgUi.Px(12)), e.Bounds.Height);
         TextRenderer.DrawText(g, e.Header.Text, Font, r, Sub, TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
         using (Pen p = new Pen(Line)) g.DrawLine(p, e.Bounds.Left, e.Bounds.Bottom - 1, e.Bounds.Right, e.Bounds.Bottom - 1);
     }
@@ -218,18 +268,19 @@ public class MgList : ListView {
         using (Pen p = new Pen(Line)) g.DrawLine(p, r.Left, r.Bottom - 1, r.Right, r.Bottom - 1);
         string text = e.SubItem.Text ?? "";
         Color c = ForeColor;
-        Rectangle tr = new Rectangle(r.X + 12, r.Y, Math.Max(0, r.Width - 18), r.Height);
+        Rectangle tr = new Rectangle(r.X + MgUi.Px(12), r.Y, Math.Max(0, r.Width - MgUi.Px(18)), r.Height);
         if (e.ColumnIndex == 1) {
             c = text == "Done" ? Good : (text.StartsWith("Failed") ? Bad : Sub);
             string tag = e.SubItem.Tag as string; double pct;
             if (tag != null && double.TryParse(tag, NumberStyles.Float, CultureInfo.InvariantCulture, out pct)) {
-                tr = new Rectangle(tr.X, r.Y + 2, tr.Width, r.Height - 14);
-                RectangleF bar = new RectangleF(tr.X, r.Bottom - 14, Math.Max(10, tr.Width - 6), 4);
+                int zone = MgUi.Px(16);   // space for the bar under the text
+                tr = new Rectangle(tr.X, r.Y + MgUi.Px(2), tr.Width, r.Height - zone);
+                RectangleF bar = new RectangleF(tr.X, r.Bottom - zone + MgUi.S(2), Math.Max(10, tr.Width - MgUi.Px(6)), MgUi.S(4));
                 g.SmoothingMode = SmoothingMode.AntiAlias;
-                using (GraphicsPath p = MgUi.Round(bar, 2)) using (SolidBrush b = new SolidBrush(Track)) g.FillPath(b, p);
+                using (GraphicsPath p = MgUi.Round(bar, MgUi.S(2))) using (SolidBrush b = new SolidBrush(Track)) g.FillPath(b, p);
                 float w = (float)(bar.Width * Math.Max(0, Math.Min(100, pct)) / 100);
                 if (w >= 1)
-                    using (GraphicsPath p = MgUi.Round(new RectangleF(bar.X, bar.Y, w, bar.Height), 2))
+                    using (GraphicsPath p = MgUi.Round(new RectangleF(bar.X, bar.Y, w, bar.Height), MgUi.S(2)))
                     using (SolidBrush b = new SolidBrush(Accent)) g.FillPath(b, p);
                 g.SmoothingMode = SmoothingMode.Default;
             }
@@ -248,7 +299,8 @@ public class MgList : ListView {
         base.WndProc(ref m);
         if (m.Msg == 0x000F && Items.Count == 0 && !string.IsNullOrEmpty(EmptyText)) {
             using (Graphics g = CreateGraphics()) {
-                Rectangle r = new Rectangle(20, 70, Math.Max(0, ClientSize.Width - 40), Math.Max(0, ClientSize.Height - 70));
+                int top = Font.Height * 3, side = MgUi.Px(20);
+                Rectangle r = new Rectangle(side, top, Math.Max(0, ClientSize.Width - 2 * side), Math.Max(0, ClientSize.Height - top));
                 TextRenderer.DrawText(g, EmptyText, Font, r, Sub, TextFormatFlags.HorizontalCenter | TextFormatFlags.Top | TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix);
             }
         }
@@ -276,6 +328,8 @@ catch {   # could not use the saved copy: compile in memory this time
     Get-ChildItem "$App\ui-*.dll" -ErrorAction Ignore | Remove-Item -Force -ErrorAction Ignore
     Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition $UiCode
 }
+# Draw at the screen's real resolution (otherwise Windows stretches the windows and text looks blurry)
+[void][Hotkey]::SetProcessDPIAware()
 [Windows.Forms.Application]::EnableVisualStyles()
 [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
 
@@ -314,13 +368,21 @@ $Palette = if ($Dark) {
 }
 $Palette += @{ YouTube = '#E62117'; YouTubeHover = '#C41B12'; Spotify = '#1DB954'; SpotifyHover = '#18A148' }
 $T = @{}; foreach ($k in $Palette.Keys) { $T[$k] = Color $Palette[$k] }
+# Display scaling: 1 at 100%, 1.5 at 150%. MEDIAGRAB_SCALE lets the build check try other sizes.
+$gfx = [Drawing.Graphics]::FromHwnd([IntPtr]::Zero); $Z = $gfx.DpiX / 96; $gfx.Dispose()
+$FontZ = if ($env:MEDIAGRAB_SCALE) { [double]$env:MEDIAGRAB_SCALE } else { 1 }
+$Z *= $FontZ; [MgUi]::Scale = $Z
+function Px($n) { [int][math]::Round($n * $Z) }
+function New-Font($size, $bold) { New-Object Drawing.Font($(if ($bold) { 'Segoe UI Semibold' } else { 'Segoe UI' }), [single]($size * $FontZ)) }
 $Fonts = @{
-    Base   = New-Object Drawing.Font('Segoe UI', 10)
-    Small  = New-Object Drawing.Font('Segoe UI Semibold', 8.25)
-    Button = New-Object Drawing.Font('Segoe UI Semibold', 9.75)
-    Head   = New-Object Drawing.Font('Segoe UI Semibold', 11)
-    Title  = New-Object Drawing.Font('Segoe UI Semibold', 14)
+    Base   = New-Font 10.5
+    Small  = New-Font 9 $true
+    Url    = New-Font 9
+    Button = New-Font 10 $true
+    Head   = New-Font 12 $true
+    Title  = New-Font 15 $true
 }
+$CtlH = [math]::Max((Px 36), $Fonts.Base.Height + (Px 14))   # height of boxes, buttons and switches
 
 # ============================ Helpers =============================
 function Get-TabUrl {
@@ -362,36 +424,61 @@ function Add-Ctl($form, $type, $props) {
     $name = if ($type -like 'Mg*') { $type } else { "Windows.Forms.$type" }
     $c = New-Object $name -Property $props; $form.Controls.Add($c); $c
 }
+# Everything below takes positions in real pixels; sizes come from Px (scaled) or measured text
+function TextW($text, $font) { [Windows.Forms.TextRenderer]::MeasureText("$text", $font).Width }
 function Add-Label($form, $text, $x, $y, $props = @{}) {
-    $p = @{ Text = $text; Location = "$x,$y"; AutoSize = $true; ForeColor = $T.Sub }
+    $p = @{ Text = $text; Location = New-Object Drawing.Point($x, $y); AutoSize = $true; ForeColor = $T.Sub }
     foreach ($k in $props.Keys) { $p[$k] = $props[$k] }
     Add-Ctl $form Label $p
 }
+# A label centred on a row of boxes that starts at $y
+function Add-RowLabel($form, $text, $x, $y, $props = @{}) {
+    $l = Add-Label $form $text $x $y $props
+    $l.Top = $y + [int](($CtlH - $l.PreferredHeight) / 2); $l
+}
 function Add-Field($form, $x, $y, $w) {
-    $f = Add-Ctl $form MgField @{ Location = "$x,$y"; Size = "$w,32"; Border = $T.Border; FocusColor = $T.Focus; Fill = $T.Field }
+    $f = Add-Ctl $form MgField @{ Location = New-Object Drawing.Point($x, $y); Size = New-Object Drawing.Size($w, $CtlH); Border = $T.Border; FocusColor = $T.Focus; Fill = $T.Field }
     $f.Box.ForeColor = $T.Text; $f.Box.Font = $Fonts.Base
     $f.Box
 }
-function Add-Button($form, $text, $x, $y, $w, $h, $style = 'neutral') {
+function ButtonW($text, $min = 90) { [math]::Max((Px $min), (TextW $text $Fonts.Button) + (Px 36)) }
+function Add-Button($form, $text, $x, $y, $w = 0, $style = 'neutral') {
+    if (-not $w) { $w = ButtonW $text }
     $fill, $hover, $fg = if ($style -eq 'primary') { $T.Primary, $T.PrimaryHover, $T.PrimaryText } else { $T.Btn, $T.BtnHover, $T.Text }
-    Add-Ctl $form MgButton @{ Text = $text; Location = "$x,$y"; Size = "$w,$h"; Fill = $fill; Hover = $hover; ForeColor = $fg; Font = $Fonts.Button }
+    Add-Ctl $form MgButton @{ Text = $text; Location = New-Object Drawing.Point($x, $y); Size = New-Object Drawing.Size($w, $CtlH)
+        Fill = $fill; Hover = $hover; ForeColor = $fg; Font = $Fonts.Button }
 }
+# Width a row of options needs so every word fits
+function SegW($items) { $items.Count * (($items | ForEach-Object { TextW $_ $Fonts.Base } | Measure-Object -Maximum).Maximum + (Px 22)) + (Px 6) }
 function Add-Segments($form, $items, $x, $y, $w) {
-    $s = Add-Ctl $form MgSegments @{ Location = "$x,$y"; Size = "$w,32"; Track = $T.Track; Pill = $T.Pill; PillText = $T.Text; Sub = $T.Sub; ForeColor = $T.Text; Font = $Fonts.Base }
+    $s = Add-Ctl $form MgSegments @{ Location = New-Object Drawing.Point($x, $y); Size = New-Object Drawing.Size([math]::Max($w, (SegW $items)), $CtlH)
+        Track = $T.Track; Pill = $T.Pill; PillText = $T.Text; Sub = $T.Sub; ForeColor = $T.Text; Font = $Fonts.Base }
     $s.Items = [string[]]$items
     $s
 }
-function New-Window($title, $size) {
-    $f = New-Object Windows.Forms.Form -Property @{ Text = $title; ClientSize = $size; FormBorderStyle = 'FixedSingle'; MaximizeBox = $false; MinimizeBox = $false
+function New-Window($title, $w, $h, [switch]$Sizable) {
+    $f = New-Object Windows.Forms.Form -Property @{ Text = $title; MaximizeBox = $false; MinimizeBox = $false
         StartPosition = 'CenterScreen'; BackColor = $T.Bg; ForeColor = $T.Text; Font = $Fonts.Base }
+    $f.FormBorderStyle = if ($Sizable) { 'Sizable' } else { 'FixedSingle' }
+    $f.ClientSize = New-Object Drawing.Size($w, $h)
     if ($Dark) { $f.Add_HandleCreated({ [MgUi]::DarkTitle($this.Handle) }) }
     $f
+}
+# Keeps a window on the screen: shrinks it and adds a scroll bar if it is too tall
+function Fit-Screen($form) {
+    $max = [Windows.Forms.Screen]::PrimaryScreen.WorkingArea.Height - (Px 80)
+    if ($form.Height -gt $max) {
+        $form.AutoScroll = $true
+        $form.ClientSize = New-Object Drawing.Size(($form.ClientSize.Width + [Windows.Forms.SystemInformation]::VerticalScrollBarWidth), ($form.ClientSize.Height - ($form.Height - $max)))
+    }
 }
 
 function Set-Hotkey($text) {
     $keys = $text -split '\s*\+\s*'; $mods = 0
     foreach ($k in $keys[0..($keys.Count - 2)]) { $m = @{ Alt = 1; Ctrl = 2; Shift = 4; Win = 8 }[$k]; if (-not $m) { return $false }; $mods += $m }
-    try { $vk = [int][Windows.Forms.Keys]$keys[-1] } catch { return $false }
+    $key = if ($keys[-1] -match '^\d$') { "D$($keys[-1])" } else { $keys[-1] }
+    try { $vk = [int][Windows.Forms.Keys]$key } catch { return $false }
+    if ($mods -eq 0 -or $mods -eq 4) { return $false }   # needs Ctrl, Alt or Win
     $Tray.Text = "MediaGrab ($text)"
     $List.EmptyText = "No downloads yet.`nPress $text on a YouTube video or Spotify song to start."
     $List.Invalidate()
@@ -443,17 +530,25 @@ function Start-Setup {
 Start-Setup
 
 # ===================== Downloads window (progress + history) =====================
-$D = New-Window 'MediaGrab - Downloads' '700,440'
-$D.FormBorderStyle = 'Sizable'; $D.MinimumSize = '560,320'; $D.MaximizeBox = $true; $D.MinimizeBox = $true
-[void](Add-Label $D 'Downloads' 20 16 @{ Font = $Fonts.Title; ForeColor = $T.Text })
-$List = Add-Ctl $D MgList @{ Location = '20,60'; Size = '660,312'; Anchor = 'Top,Bottom,Left,Right'; BackColor = $T.Card; ForeColor = $T.Text
+$M = Px 20; $G = Px 10
+$WA = [Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+$DW = [math]::Min((Px 780), $WA.Width - (Px 40)); $DH = [math]::Min((Px 500), $WA.Height - (Px 80))
+$D = New-Window 'MediaGrab - Downloads' $DW $DH -Sizable
+$D.MinimumSize = New-Object Drawing.Size([math]::Min((Px 600), $DW), [math]::Min((Px 360), $DH)); $D.MaximizeBox = $true; $D.MinimizeBox = $true
+$head = Add-Label $D 'Downloads' $M $M @{ Font = $Fonts.Title; ForeColor = $T.Text }
+$listTop = $M + $head.PreferredHeight + $G
+$btnY = $D.ClientSize.Height - $M - $CtlH
+$List = Add-Ctl $D MgList @{ Location = New-Object Drawing.Point($M, $listTop); Size = New-Object Drawing.Size(($D.ClientSize.Width - 2 * $M), ($btnY - $G - $listTop))
+    Anchor = 'Top,Bottom,Left,Right'; BackColor = $T.Card; ForeColor = $T.Text; RowHeight = $Fonts.Base.Height * 2 + (Px 12)
     Head = $T.Card; Line = $T.Line; Sub = $T.Sub; Accent = $T.Focus; Track = $T.Track; Sel = $T.Sel; Good = $T.Good; Bad = $T.Bad; ShowItemToolTips = $true }
-foreach ($col in ('Name', 300), ('Status', 230), ('Date', 130)) { [void]$List.Columns.Add($col[0], $col[1]) }
+$dateW = (TextW '2026-12-31 23:59' $Fonts.Base) + (Px 36)
+foreach ($col in ('Name', 300), ('Status', (Px 290)), ('Date', $dateW)) { [void]$List.Columns.Add($col[0], $col[1]) }
 $List.FitColumns()
 if ($Dark) { $List.Add_HandleCreated({ [MgUi]::DarkScroll($this.Handle) }) }
-$ShowBtn  = Add-Button $D 'Show in folder' 20 386 132 36
-$ClearBtn = Add-Button $D 'Clear finished' 160 386 124 36
-$OpenBtn  = Add-Button $D 'Open download folder' 508 386 172 36
+$ShowBtn  = Add-Button $D 'Show in folder' $M $btnY
+$ClearBtn = Add-Button $D 'Clear finished' ($ShowBtn.Right + $G) $btnY
+$openW    = ButtonW 'Open download folder'
+$OpenBtn  = Add-Button $D 'Open download folder' ($D.ClientSize.Width - $M - $openW) $btnY $openW
 $ShowBtn.Anchor = $ClearBtn.Anchor = 'Bottom,Left'; $OpenBtn.Anchor = 'Bottom,Right'
 $D.Add_FormClosing({ if ($_.CloseReason -eq 'UserClosing') { $_.Cancel = $true; $D.Hide() } })
 
@@ -493,30 +588,48 @@ if (Test-Path $HistFile) {   # a damaged history file is ignored
 }
 
 # ========================= Download window ========================
-$F = New-Window 'MediaGrab' '640,456'
+$M = Px 24; $G = Px 12; $RowGap = Px 10
+$rowNames = 'FILE TYPE', 'VIDEO', 'TRIM', 'SAVE TO', 'FILE NAME'
+$LW  = ($rowNames | ForEach-Object { TextW $_ $Fonts.Small } | Measure-Object -Maximum).Maximum + (Px 20)   # label column
+$CW  = [math]::Max((Px 500), [math]::Max((SegW $Choices.Format), (SegW $Choices.VideoQuality)))           # box column
+$X0  = $M + $LW; $FW = $X0 + $CW + $M                                                                       # window width
+$F = New-Window 'MediaGrab' $FW (Px 500)
 $F.TopMost = $true
-$U = @{
-    Pic   = Add-Ctl $F MgThumb @{ Location = '24,24'; Size = '192,108'; Empty = $T.Track }
-    Title = Add-Ctl $F Label   @{ Location = '230,20'; Size = '388,54'; AutoEllipsis = $true; Font = $Fonts.Title; ForeColor = $T.Text }
-    Info  = Add-Ctl $F Label   @{ Location = '232,76'; Size = '386,20'; AutoEllipsis = $true; ForeColor = $T.Sub }
-    Match = Add-Ctl $F ComboBox @{ Location = '232,98'; Width = 386; DropDownStyle = 'DropDownList'; FlatStyle = 'Flat'; BackColor = $T.Field; ForeColor = $T.Text }
-    Url   = Add-Ctl $F Label   @{ Location = '232,126'; Size = '386,18'; AutoEllipsis = $true; ForeColor = $T.Faint; Font = New-Object Drawing.Font('Segoe UI', 8.5) }
-}
-[void](Add-Ctl $F Panel @{ Location = '24,154'; Size = '592,1'; BackColor = $T.Line })
-foreach ($l in ('FILE TYPE', 177), ('VIDEO', 221), ('TRIM', 265), ('SAVE TO', 309), ('FILE NAME', 353)) {
-    [void](Add-Label $F $l[0] 24 $l[1] @{ Font = $Fonts.Small })
-}
-$U.Type  = Add-Segments $F $Choices.Format 112 168 504
-$U.VQ    = Add-Segments $F $Choices.VideoQuality 112 212 504
-$U.Start = Add-Field $F 112 256 150
-[void](Add-Label $F 'to' 272 262)
-$U.End   = Add-Field $F 298 256 150
-$U.Dir   = Add-Field $F 112 300 404
-$Browse  = Add-Button $F 'Browse' 524 300 92 32
-$U.Name  = Add-Field $F 112 344 430
-$U.Ext   = Add-Label $F '' 550 350
-$U.Close = Add-Button $F 'Close' 420 400 92 40
-$U.Go    = Add-Button $F 'Download' 520 400 96 40
+$thumbW = Px 208; $thumbH = Px 117; $HX = $M + $thumbW + (Px 16); $HW = $FW - $M - $HX
+$U = @{ Pic = Add-Ctl $F MgThumb @{ Location = New-Object Drawing.Point($M, $M); Size = New-Object Drawing.Size($thumbW, $thumbH); Empty = $T.Track } }
+$U.Title = Add-Ctl $F Label @{ Location = New-Object Drawing.Point($HX, ($M - (Px 3))); Size = New-Object Drawing.Size($HW, ($Fonts.Title.Height * 2 + (Px 4)))
+    AutoEllipsis = $true; Font = $Fonts.Title; ForeColor = $T.Text; UseMnemonic = $false }
+$U.Info  = Add-Ctl $F Label @{ Location = New-Object Drawing.Point($HX, ($U.Title.Bottom + (Px 2))); Size = New-Object Drawing.Size($HW, ($Fonts.Base.Height + (Px 4)))
+    AutoEllipsis = $true; ForeColor = $T.Sub; UseMnemonic = $false }
+$y = $U.Info.Bottom + (Px 4)
+$U.Match = Add-Ctl $F ComboBox @{ Location = New-Object Drawing.Point($HX, $y); Width = $HW; DropDownStyle = 'DropDownList'; FlatStyle = 'Flat'
+    BackColor = $T.Field; ForeColor = $T.Text; Font = $Fonts.Base }
+$U.Url   = Add-Ctl $F Label @{ Location = New-Object Drawing.Point($HX, $y); Size = New-Object Drawing.Size($HW, ($Fonts.Url.Height + (Px 4)))
+    AutoEllipsis = $true; ForeColor = $T.Faint; Font = $Fonts.Url; UseMnemonic = $false }
+$y = [math]::Max(($M + $thumbH), $U.Match.Bottom) + (Px 16)
+[void](Add-Ctl $F Panel @{ Location = New-Object Drawing.Point($M, $y); Size = New-Object Drawing.Size(($FW - 2 * $M), 1); BackColor = $T.Line })
+$y += Px 16
+$rowY = @{}
+foreach ($n in $rowNames) { $rowY[$n] = $y; [void](Add-RowLabel $F $n $M $y @{ Font = $Fonts.Small }); $y += $CtlH + $RowGap }
+$U.Type  = Add-Segments $F $Choices.Format $X0 $rowY['FILE TYPE'] $CW
+$U.VQ    = Add-Segments $F $Choices.VideoQuality $X0 $rowY['VIDEO'] $CW
+$toW     = TextW 'to' $Fonts.Base
+$trimW   = [int](($CW - $toW - 2 * $G) / 2)
+$U.Start = Add-Field $F $X0 $rowY['TRIM'] $trimW
+[void](Add-RowLabel $F 'to' ($X0 + $trimW + $G) $rowY['TRIM'])
+$U.End   = Add-Field $F ($X0 + $CW - $trimW) $rowY['TRIM'] $trimW
+$browseW = ButtonW 'Browse'
+$U.Dir   = Add-Field $F $X0 $rowY['SAVE TO'] ($CW - $browseW - $G)
+$Browse  = Add-Button $F 'Browse' ($X0 + $CW - $browseW) $rowY['SAVE TO'] $browseW
+$extW    = (TextW '.flac' $Fonts.Base) + (Px 8)
+$U.Name  = Add-Field $F $X0 $rowY['FILE NAME'] ($CW - $extW - $G)
+$U.Ext   = Add-RowLabel $F '.mp3' ($X0 + $CW - $extW) $rowY['FILE NAME']
+$y += Px 12
+$goW = ButtonW 'Download' 110; $closeW = ButtonW 'Close'
+$U.Go    = Add-Button $F 'Download' ($FW - $M - $goW) $y $goW
+$U.Close = Add-Button $F 'Close' ($U.Go.Left - $G - $closeW) $y $closeW
+$F.ClientSize = New-Object Drawing.Size($FW, ($U.Go.Bottom + $M))
+Fit-Screen $F
 $U.Go.ForeColor = 'White'; $U.Close.DialogResult = 'Cancel'
 $U.Type.Add_Changed({ $U.Ext.Text = ".$($U.Type.Value)"; $U.VQ.Enabled = $U.Type.Value -eq 'mp4' })
 $F.AcceptButton = $U.Go
@@ -660,40 +773,57 @@ function Show-Dialog($url, $kind) {
 
 # ========================= Settings window ========================
 function Show-Settings([switch]$Shot) {
-    $W = New-Window 'MediaGrab - Settings' '560,600'
-    $W.TopMost = $true
     $rows = @(
         @('#', 'General'), @('Hotkey', 'Keyboard shortcut'), @('SaveDir', 'Download folder'), @('FileName', 'Default file name'), @('Browsers', 'Browsers (comma separated)'),
         @('#', 'Audio and video'), @('Format', 'Default file type'), @('VideoQuality', 'Default video quality'), @('AudioQuality', 'Audio quality (0 best, 10 smallest)'), @('EmbedInfo', 'Add song info and cover art'),
         @('#', 'Trim and Spotify'), @('StartTime', 'Default start time'), @('EndTime', 'Default end time'), @('MatchTolerance', 'Spotify match tolerance (seconds)')
     )
-    $box = @{}; $y = 12
+    $M = Px 24; $G = Px 12
+    $LW = ($rows | Where-Object { $_[0] -ne '#' } | ForEach-Object { TextW $_[1] $Fonts.Base } | Measure-Object -Maximum).Maximum + (Px 24)
+    $CW = [math]::Max((Px 320), [math]::Max((SegW $Choices.Format), (SegW $Choices.VideoQuality)))
+    $X0 = $M + $LW; $SW = $X0 + $CW + $M
+    $W = New-Window 'MediaGrab - Settings' $SW (Px 600)
+    $W.TopMost = $true
+    $box = @{}; $y = Px 8
     foreach ($r in $rows) {
-        if ($r[0] -eq '#') { [void](Add-Label $W $r[1] 24 ($y + 10) @{ Font = $Fonts.Head; ForeColor = $T.Text }); $y += 42; continue }
+        if ($r[0] -eq '#') { [void](Add-Label $W $r[1] $M ($y + (Px 12)) @{ Font = $Fonts.Head; ForeColor = $T.Text }); $y += $Fonts.Head.Height + (Px 22); continue }
         $k = $r[0]
-        [void](Add-Label $W $r[1] 24 ($y + 6) @{ ForeColor = $T.Sub })
-        if ($Choices[$k]) { $box[$k] = Add-Segments $W $Choices[$k] 280 $y 256; $box[$k].Value = $C[$k] }
-        else { $box[$k] = Add-Field $W 280 $y $(if ($k -eq 'SaveDir') { 178 } else { 256 }); $box[$k].Text = $C[$k] }
-        if ($k -eq 'SaveDir') { $b = Add-Button $W 'Browse' 464 $y 72 32; $b.Add_Click({ Pick-Folder $box.SaveDir $W }) }
-        $y += 38
+        [void](Add-RowLabel $W $r[1] $M $y)
+        if ($Choices[$k]) { $box[$k] = Add-Segments $W $Choices[$k] $X0 $y $CW; $box[$k].Value = $C[$k] }
+        elseif ($k -eq 'Hotkey') {
+            $kf = Add-Ctl $W MgKeyField @{ Location = New-Object Drawing.Point($X0, $y); Size = New-Object Drawing.Size($CW, $CtlH); Border = $T.Border; FocusColor = $T.Focus; Fill = $T.Field }
+            $kf.Box.ForeColor = $T.Text; $kf.Box.Font = $Fonts.Base; $kf.Value = $C.Hotkey
+            # pause the current shortcut while a new one is pressed, so it does not open the download window
+            $kf.Box.Add_GotFocus({ $hk.Unregister() }); $kf.Box.Add_LostFocus({ [void](Set-Hotkey $C.Hotkey) })
+            $box[$k] = $kf
+        }
+        elseif ($k -eq 'SaveDir') {
+            $bw = ButtonW 'Browse'
+            $box[$k] = Add-Field $W $X0 $y ($CW - $bw - $G); $box[$k].Text = $C[$k]
+            $b = Add-Button $W 'Browse' ($X0 + $CW - $bw) $y $bw; $b.Add_Click({ Pick-Folder $box.SaveDir $W })
+        }
+        else { $box[$k] = Add-Field $W $X0 $y $CW; $box[$k].Text = $C[$k] }
+        $y += $CtlH + (Px 8)
     }
-    $auto = Add-Ctl $W CheckBox @{ Location = "24,$($y + 10)"; AutoSize = $true; Text = 'Start MediaGrab when Windows starts'; ForeColor = $T.Text; Enabled = [bool]$ExePath
-                                   Checked = [bool](Get-ItemProperty $RunKey -Name MediaGrab -ErrorAction Ignore) }
-    $y += 56
-    [void](Add-Label $W "MediaGrab $Version" 24 ($y + 12) @{ ForeColor = $T.Faint })
-    $save = Add-Button $W 'Save' 340 $y 96 40 'primary'
-    $W.CancelButton = Add-Button $W 'Cancel' 444 $y 92 40
+    $auto = Add-Ctl $W CheckBox @{ Location = New-Object Drawing.Point($M, ($y + (Px 12))); AutoSize = $true; Text = 'Start MediaGrab when Windows starts'; ForeColor = $T.Text
+                                   Enabled = [bool]$ExePath; Checked = [bool](Get-ItemProperty $RunKey -Name MediaGrab -ErrorAction Ignore) }
+    $y = $auto.Bottom + (Px 24)
+    $saveW = ButtonW 'Save'; $cancelW = ButtonW 'Cancel'
+    $save = Add-Button $W 'Save' ($SW - $M - $cancelW - $G - $saveW) $y $saveW 'primary'
+    $W.CancelButton = Add-Button $W 'Cancel' ($SW - $M - $cancelW) $y $cancelW
     $W.CancelButton.DialogResult = 'Cancel'
     $W.AcceptButton = $save
-    $W.ClientSize = "560,$($y + 60)"
+    [void](Add-RowLabel $W "MediaGrab $Version" $M $y @{ ForeColor = $T.Faint })
+    $W.ClientSize = New-Object Drawing.Size($SW, ($y + $CtlH + $M))
+    Fit-Screen $W
 
     $save.Add_Click({
-        $new = @{}; foreach ($k in $box.Keys) { $new[$k] = if ($box[$k] -is [MgSegments]) { $box[$k].Value } else { $box[$k].Text.Trim() } }
+        $new = @{}; foreach ($k in $box.Keys) { $new[$k] = if ($box[$k] -is [MgSegments] -or $box[$k] -is [MgKeyField]) { $box[$k].Value } else { $box[$k].Text.Trim() } }
         $err = if ($new.AudioQuality -notmatch '^(10|\d)$') { 'Audio quality must be a number from 0 to 10.' }
                elseif ($new.MatchTolerance -notmatch '^\d+(\.\d+)?$') { 'Match tolerance must be a number.' }
                elseif (-not ((Test-Time $new.StartTime) -and (Test-Time $new.EndTime))) { 'Times must look like 90 or 1:30.' }
                elseif (-not $new.SaveDir) { 'Choose a download folder.' }
-               elseif (-not (Set-Hotkey $new.Hotkey)) { [void](Set-Hotkey $C.Hotkey); "Shortcut '$($new.Hotkey)' is invalid or used by another program. Example: Ctrl+Shift+D" }
+               elseif (-not (Set-Hotkey $new.Hotkey)) { [void](Set-Hotkey $C.Hotkey); "The shortcut $($new.Hotkey) is already used by Windows or another program. Click the shortcut box and press a different one." }
         if ($err) { [void][Windows.Forms.MessageBox]::Show($W, $err, 'MediaGrab'); return }
         foreach ($k in $new.Keys) { $C[$k] = $new[$k] }
         Save-Config
@@ -702,6 +832,7 @@ function Show-Settings([switch]$Shot) {
     })
     if ($Shot) { Save-Shot $W 'settings'; $W.Close() } else { [void]$W.ShowDialog() }
     $W.Dispose()
+    [void](Set-Hotkey $C.Hotkey)   # make sure the shortcut is active again
 }
 
 # ===================== Tray icon and background work =====================
@@ -784,6 +915,21 @@ function Save-Shot($form, $name) {
     $shot = New-Object Drawing.Bitmap $form.Width, $form.Height
     $gr = [Drawing.Graphics]::FromImage($shot); $gr.CopyFromScreen($form.Location, [Drawing.Point]::Empty, $form.Size); $gr.Dispose()
     $shot.Save("$env:MEDIAGRAB_SELFTEST\$name.png"); $shot.Dispose()
+    Test-Layout $form $name
+}
+# Finds text or boxes that overlap, stick out of the window, or are cut off
+function Test-Layout($form, $name) {
+    $what = { param($c) "$($c.GetType().Name) '$($c.Text)'" }
+    $cs = @($form.Controls | Where-Object { $_.Visible -and $_.Height -gt 1 })
+    $bad = [Collections.ArrayList]@()
+    for ($i = 0; $i -lt $cs.Count; $i++) {
+        $a = $cs[$i]
+        for ($j = $i + 1; $j -lt $cs.Count; $j++) { if ($a.Bounds.IntersectsWith($cs[$j].Bounds)) { [void]$bad.Add("$(& $what $a) overlaps $(& $what $cs[$j])") } }
+        if (-not $form.AutoScroll -and ($a.Right -gt $form.ClientSize.Width -or $a.Bottom -gt $form.ClientSize.Height)) { [void]$bad.Add("$(& $what $a) sticks out of the window") }
+        if ($a -is [Windows.Forms.Label] -and -not $a.AutoEllipsis -and $a.PreferredWidth -gt $a.Width + 1) { [void]$bad.Add("$(& $what $a) is cut off") }
+        if ($a -is [MgButton] -and (TextW $a.Text $a.Font) -gt $a.Width - (Px 8)) { [void]$bad.Add("$(& $what $a) text does not fit") }
+    }
+    Check ($bad.Count -eq 0) "Layout of '$name' window (scale $([math]::Round($Z, 2)))$(if ($bad.Count) { ': ' + ($bad -join '; ') })"
 }
 function Wait-Until([scriptblock]$done, $seconds) {
     $end = (Get-Date).AddSeconds($seconds)
@@ -802,6 +948,7 @@ if ($env:MEDIAGRAB_SELFTEST) {
     function Check($ok, $what) { [void]$Log.Add("$(if ($ok) { 'PASS' } else { 'FAIL' })  $what"); if (-not $ok) { $script:Fails++ } }
     $C.SaveDir = "$env:MEDIAGRAB_SELFTEST\downloads"
     Check $HotkeyOk "Keyboard shortcut $($C.Hotkey) registered"
+    Check ((Set-Hotkey 'Ctrl+Shift+1') -and -not (Set-Hotkey 'Shift+K') -and (Set-Hotkey $C.Hotkey)) 'Shortcuts with numbers work; ones without Ctrl, Alt or Win are refused'
     Check (Wait-Until { -not $S.Setup } 600) 'Setup finished within 10 minutes'
     Check (Test-Tools) 'yt-dlp, ffmpeg and ffprobe are installed'
     $r = Start-YtDlp '--version'; $r.P.WaitForExit()

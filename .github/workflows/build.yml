@@ -54,10 +54,11 @@ jobs:
           powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File src\MediaGrab.ps1
           exit $LASTEXITCODE
 
-      - name: Self-test, dark mode (later start, only checks for updates)
+      - name: Self-test, dark mode at 150% size (later start, only checks for updates)
         shell: powershell
         run: |
           $env:MEDIAGRAB_THEME = 'dark'
+          $env:MEDIAGRAB_SCALE = '1.5'
           $env:MEDIAGRAB_SELFTEST = "$PWD\selftest\dark"
           New-Item $env:MEDIAGRAB_SELFTEST -ItemType Directory -Force | Out-Null
           powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File src\MediaGrab.ps1
