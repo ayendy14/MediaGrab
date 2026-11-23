@@ -942,7 +942,7 @@ function Show-Settings {
     $CW = [math]::Max((Px 320), [math]::Max((SegW $Choices.Format), (SegW $Choices.VideoQuality)))
     $X0 = $M + $LW; $SW = $X0 + $CW + $M
     $W = New-Window 'MediaGrab - Settings' $SW (Px 600)
-    $W.TopMost = $true
+    $W.TopMost = $true; $W.Icon = $Tray.Icon
     $P = New-Page $W $SW
     $box = @{}; $y = Px 8
     foreach ($r in $rows) {
