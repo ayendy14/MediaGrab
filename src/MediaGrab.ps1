@@ -461,7 +461,7 @@ function Show-Downloads { $D.Show(); $D.WindowState = 'Normal'; $D.Activate() }
 function Add-Entry($e) {
     $e.Item = New-Object Windows.Forms.ListViewItem($e.Name)
     [void]$e.Item.SubItems.Add($e.Status); [void]$e.Item.SubItems.Add($e.Date)
-    $e.Item.Tag = $e; $List.Items.Insert(0, $e.Item); $List.Invalidate()
+    $e.Item.Tag = $e; [void]$List.Items.Insert(0, $e.Item); $List.Invalidate()
 }
 # $pct (e.g. '42.5') shows a progress bar under the status
 function Set-Status($e, $text, $pct = $null) {
@@ -545,7 +545,8 @@ function Meta-Arg($field, $value) {
     if ($value) { " --parse-metadata `"$($value -replace '[\\"]' -replace '%', '%%' -replace ':', '\:')#:(?P<meta_$field>.+)#`"" }
 }
 
-$U.Go.Add_Click({
+# Starts the download with the choices in the Download window
+function Start-Download {
     $from, $to, $dir, $name = ($U.Start, $U.End, $U.Dir, $U.Name).Text.Trim()
     if (-not $from) { $from = $C.StartTime }; if (-not $to) { $to = $C.EndTime }
     if (-not $dir)  { $dir = $C.SaveDir };    if (-not $name) { $name = if ($C.FileName) { $C.FileName } else { $S.Name } }
@@ -576,7 +577,8 @@ $U.Go.Add_Click({
     Add-Entry $e; [void]$S.Active.Add($e)
     $S.Started = $true
     $F.Close()
-})
+}
+$U.Go.Add_Click({ Start-Download })
 
 # Fills in details once yt-dlp answers (for Spotify: lists YouTube results, picks the one closest in length)
 $Poll = New-Object Windows.Forms.Timer -Property @{ Interval = 250 }
@@ -792,7 +794,7 @@ function Start-Fake($url, $name) {   # starts a download the same way the Downlo
     $S.Kind = 'youtube'; $S.Url = $S.Target = $url; $S.Name = $name; $S.Started = $null
     foreach ($b in $U.Start, $U.End, $U.Name) { $b.Text = '' }
     $U.Type.Value = 'mp3'
-    $U.Go.PerformClick()
+    Start-Download
     @(Get-Entries)[0]
 }
 if ($env:MEDIAGRAB_SELFTEST) {
