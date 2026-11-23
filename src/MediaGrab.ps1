@@ -64,6 +64,7 @@ public static class MgUi {
     [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)] static extern int SetWindowTheme(IntPtr h, string app, string id);
     public static void DarkTitle(IntPtr h) { int on = 1; if (DwmSetWindowAttribute(h, 20, ref on, 4) != 0) DwmSetWindowAttribute(h, 19, ref on, 4); }
     public static void DarkScroll(IntPtr h) { SetWindowTheme(h, "DarkMode_Explorer", null); }
+    public static void DarkCombo(IntPtr h) { SetWindowTheme(h, "DarkMode_CFD", null); }
     public static GraphicsPath Round(RectangleF r, float radius) {
         GraphicsPath p = new GraphicsPath();
         float d = Math.Min(radius * 2, Math.Min(r.Width, r.Height));
@@ -274,10 +275,14 @@ public class MgList : ListView {
         Head = Color.White; Line = Color.Gainsboro; Sub = Color.Gray; Accent = Color.RoyalBlue; Track = Color.Gainsboro;
         Sel = Color.AliceBlue; Good = Color.Green; Bad = Color.Firebrick;
     }
-    public void FitColumns() {
+    public int StatusWidth { get; set; }
+    public void FitColumns() {   // date keeps its width; name and status share the rest
         if (Columns.Count < 3) return;
-        int w = ClientSize.Width - Columns[1].Width - Columns[2].Width;
-        if (w > 80 && w != Columns[0].Width) Columns[0].Width = w;
+        int rest = ClientSize.Width - Columns[2].Width;
+        int status = Math.Max(80, Math.Min(StatusWidth > 0 ? StatusWidth : 260, rest / 2));
+        if (rest - status < 80) return;
+        if (Columns[1].Width != status) Columns[1].Width = status;
+        if (Columns[0].Width != rest - status) Columns[0].Width = rest - status;
     }
     protected override void OnResize(EventArgs e) { base.OnResize(e); FitColumns(); }
     protected override void OnDrawColumnHeader(DrawListViewColumnHeaderEventArgs e) {
@@ -324,10 +329,16 @@ public class MgList : ListView {
     }
     protected override void WndProc(ref Message m) {
         base.WndProc(ref m);
-        if (m.Msg == 0x000F && Items.Count == 0 && !string.IsNullOrEmpty(EmptyText)) {
-            using (Graphics g = CreateGraphics()) {
-                int top = Font.Height * 3, side = MgUi.Px(20);
-                Rectangle r = new Rectangle(side, top, Math.Max(0, ClientSize.Width - 2 * side), Math.Max(0, ClientSize.Height - top));
+        if (m.Msg != 0x000F) return;
+        // below the last row: plain background (the dark theme would draw column lines there), or the "no downloads" text
+        int top = Items.Count > 0 ? Items[Items.Count - 1].Bounds.Bottom : Font.Height * 2;
+        if (top >= ClientSize.Height) return;
+        using (Graphics g = CreateGraphics())
+        using (SolidBrush b = new SolidBrush(BackColor)) {
+            g.FillRectangle(b, 0, top, ClientSize.Width, ClientSize.Height - top);
+            if (Items.Count == 0 && !string.IsNullOrEmpty(EmptyText)) {
+                int side = MgUi.Px(20);
+                Rectangle r = new Rectangle(side, Font.Height * 3, Math.Max(0, ClientSize.Width - 2 * side), Math.Max(0, ClientSize.Height - Font.Height * 3));
                 TextRenderer.DrawText(g, EmptyText, Font, r, Sub, TextFormatFlags.HorizontalCenter | TextFormatFlags.Top | TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix);
             }
         }
@@ -438,7 +449,10 @@ function Start-YtDlp([string]$arguments) {
 function Get-YtError($task) {
     if (-not $task -or -not $task.IsCompleted) { return }
     $last = @($task.Result -split "`r?`n" | Where-Object { $_ -match '^ERROR:' })[-1]
-    if ($last) { ($last -replace '^ERROR:\s*(\[[^\]]+\]\s*)?([\w-]{6,}:\s*)?').Trim() }
+    if (-not $last) { return }
+    $msg = ($last -replace '^ERROR:\s*(\[[^\]]+\]\s*)?([\w-]{6,}:\s*)?' -replace '\s+(Use --|See\s+http|Also see|Please report).*$').Trim()
+    if ($msg -match 'not a bot') { $msg = 'YouTube asked to confirm you are not a bot. Wait a few minutes and try again.' }
+    $msg
 }
 
 function Test-Tools { -not ('yt-dlp', 'ffmpeg', 'ffprobe' | Where-Object { -not (Test-Path "$Bin\$_.exe") }) }
@@ -460,7 +474,7 @@ function Add-Label($parent, $text, $x, $y, $props = @{}) {
 # A label centred on a row of boxes that starts at $y
 function Add-RowLabel($parent, $text, $x, $y, $props = @{}) {
     $l = Add-Label $parent $text $x $y $props
-    $l.Top = $y + [int](($CtlH - $l.PreferredHeight) / 2); $l
+    $l.Top = $y + [int](($CtlH - $l.Font.Height) / 2); $l
 }
 function Add-Field($parent, $x, $y, $w) {
     $f = Add-Ctl $parent MgField @{ Location = New-Object Drawing.Point($x, $y); Size = New-Object Drawing.Size($w, $CtlH); Border = $T.Border; FocusColor = $T.Focus; Fill = $T.Field }
@@ -590,6 +604,7 @@ $List = Add-Ctl $D MgList @{ Location = New-Object Drawing.Point($M, $listTop); 
     Anchor = 'Top,Bottom,Left,Right'; BackColor = $T.Card; ForeColor = $T.Text; RowHeight = $Fonts.Base.Height * 2 + (Px 12)
     Head = $T.Card; Line = $T.Line; Sub = $T.Sub; Accent = $T.Focus; Track = $T.Track; Sel = $T.Sel; Good = $T.Good; Bad = $T.Bad; ShowItemToolTips = $true }
 $dateW = (TextW '2026-12-31 23:59' $Fonts.Base) + (Px 36)
+$List.StatusWidth = Px 290
 foreach ($col in ('Name', 300), ('Status', (Px 290)), ('Date', $dateW)) { [void]$List.Columns.Add($col[0], $col[1]) }
 $List.FitColumns()
 if ($Dark) { $List.Add_HandleCreated({ [MgUi]::DarkScroll($this.Handle) }) }
@@ -650,10 +665,11 @@ $U.Title = Add-Ctl $FP Label @{ Location = New-Object Drawing.Point($HX, ($M - (
 $U.Info  = Add-Ctl $FP Label @{ Location = New-Object Drawing.Point($HX, ($U.Title.Bottom + (Px 2))); Size = New-Object Drawing.Size($HW, ($Fonts.Base.Height + (Px 4)))
     AutoEllipsis = $true; ForeColor = $T.Sub; UseMnemonic = $false }
 $y = $U.Info.Bottom + (Px 4)
-$U.Match = Add-Ctl $FP ComboBox @{ Location = New-Object Drawing.Point($HX, $y); Width = $HW; DropDownStyle = 'DropDownList'; FlatStyle = 'Flat'
-    BackColor = $T.Field; ForeColor = $T.Text; Font = $Fonts.Base }
+$U.Match = Add-Ctl $FP ComboBox @{ Location = New-Object Drawing.Point($HX, $y); Width = $HW; DropDownStyle = 'DropDownList'; Font = $Fonts.Base }
+if ($Dark) { $U.Match.BackColor = $T.Field; $U.Match.ForeColor = $T.Text; $U.Match.Add_HandleCreated({ [MgUi]::DarkCombo($this.Handle) }) }
 $U.Url   = Add-Ctl $FP Label @{ Location = New-Object Drawing.Point($HX, $y); Size = New-Object Drawing.Size($HW, ($Fonts.Url.Height + (Px 4)))
     AutoEllipsis = $true; ForeColor = $T.Faint; Font = $Fonts.Url; UseMnemonic = $false }
+$InfoH = $U.Info.Height; $UrlTop = $U.Url.Top
 $y = [math]::Max(($M + $thumbH), $U.Match.Bottom) + (Px 16)
 [void](Add-Ctl $FP Panel @{ Location = New-Object Drawing.Point($M, $y); Size = New-Object Drawing.Size(($FW - 2 * $M), 1); BackColor = $T.Line })
 $y += Px 16
@@ -747,10 +763,11 @@ $Fields = '--print "%(id)s|%(duration)s|%(title)s"'
 function Get-Meta($html, $name) { [Net.WebUtility]::HtmlDecode([regex]::Match($html, "$name`" content=`"([^`"]*)").Groups[1].Value) }
 
 # Shows what went wrong in the open window
-function Show-Problem($title, $text, $hint = '') {
+function Show-Problem($title, $text, $hint = '', [switch]$Calm) {
     $Load.Stop(); $Poll.Stop()
     Log "Download window: $title - $text $hint"
-    $U.Title.Text = $title; $U.Info.Text = $text; $U.Info.ForeColor = $T.Bad
+    $U.Title.Text = $title; $U.Info.Text = $text; $U.Info.ForeColor = $(if ($Calm) { $T.Sub } else { $T.Bad })
+    $U.Info.Height = $Fonts.Base.Height * 2 + (Px 4); $U.Url.Top = $U.Info.Bottom + (Px 2)   # room for two lines
     $U.Url.Text = $hint; $U.Url.Visible = $true; $U.Match.Visible = $false; $U.Go.Enabled = $false
 }
 
@@ -810,7 +827,7 @@ function Use-Link($url) {
     if (-not (Get-Kind $url)) { try { $url = "$([Windows.Forms.Clipboard]::GetText())".Trim() } catch { $Error.RemoveAt(0) } }   # no matching tab: try a copied link
     $kind = Get-Kind $url
     Log "Link: $(if ($kind) { "$kind $url" } else { 'none found' })"
-    if (-not $kind) { Show-Problem 'No video or song found' 'Open a YouTube video or Spotify song, or copy its link,' "then press $($C.Hotkey) again."; return }
+    if (-not $kind) { Show-Problem 'No video or song found' "Open a YouTube video or Spotify song in your browser, or copy its link, then press $($C.Hotkey) again." -Calm; return }
     $S.Url = $S.Target = $url; $S.Kind = $kind
     $U.Url.Text = $url; $U.Pic.Crop = $kind -eq 'youtube'
     $U.Go.Fill  = if ($kind -eq 'spotify') { $T.Spotify } else { $T.YouTube }
@@ -878,7 +895,7 @@ $Poll.Add_Tick({
     $best = @($S.Found | Where-Object { $_.Diff -le [double]$C.MatchTolerance })[0]    # first result with matching length
     if (-not $best) { $best = $S.Found | Sort-Object Diff | Select-Object -First 1 }
     if ($S.Kind -eq 'spotify') {
-        $U.Info.Text = "Spotify length $(Format-Len $S.SpDur)$($Dot)YouTube match (change if wrong):"
+        $U.Info.Text = "Spotify $(Format-Len $S.SpDur)$($Dot)YouTube match:"
         $U.Url.Visible = $false; $U.Match.Visible = $true
         $U.Match.Items.Clear()
         foreach ($m in $S.Found) { [void]$U.Match.Items.Add("$($m.Title)  ($(Format-Len $m.Dur))") }
@@ -903,6 +920,7 @@ function Show-Dialog {
     $U.VQ.Value = $C.VideoQuality
     $U.Pic.ClearImage()
     $U.Title.Text = 'Loading...'; $U.Info.Text = 'Reading the link from your browser...'; $U.Info.ForeColor = $T.Sub
+    $U.Info.Height = $InfoH; $U.Url.Top = $UrlTop
     $U.Url.Text = ''; $U.Url.Visible = $true; $U.Match.Items.Clear(); $U.Match.Visible = $false
     $U.Go.Fill = $T.Primary; $U.Go.Hover = $T.PrimaryHover; $U.Go.Enabled = $false
     $S.Stage = 'setup'
@@ -1170,7 +1188,7 @@ if ($env:MEDIAGRAB_SELFTEST) {
     Add-Step 'Press Ctrl+Alt+Y with nothing useful copied' 5 { Copy-Text 'hello'; Show-Downloads; Press $CtrlAltY; $true }
     Add-Step 'The window explains what to do' 30 {
         if (-not $F.Visible -or -not (Wait-Idle)) { return $false }
-        Check ($U.Title.Text -eq 'No video or song found') "With no link, the window says: '$($U.Title.Text)' / '$($U.Info.Text) $($U.Url.Text)'"
+        Check ($U.Title.Text -eq 'No video or song found') "With no link, the window says: '$($U.Title.Text)' / '$($U.Info.Text)'"
         Save-Shot $F 'download-no-link'; $F.DialogResult = 'Cancel'; $true }
     Add-Step 'The window closes' 5 { -not $F.Visible }
     Add-Step 'Open Settings' 5 { $script:StepAt++; $script:StepStart = Get-Date; Show-Settings; $true }   # stays open until a later step saves
