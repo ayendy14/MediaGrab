@@ -576,7 +576,7 @@ function Start-Download {
     $e.Line = $e.P.StandardOutput.ReadLineAsync()
     Add-Entry $e; [void]$S.Active.Add($e)
     $S.Started = $true
-    $F.Close()
+    $F.DialogResult = 'OK'   # ends the dialog without destroying the window
 }
 $U.Go.Add_Click({ Start-Download })
 
