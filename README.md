@@ -11,7 +11,7 @@ A small Windows tray app: press a keyboard shortcut while a YouTube video or Spo
 - **Song info and cover art** saved inside the files
 - **Downloads window** with progress bars and a download history; warns before downloading the same thing twice, and shows why a download failed
 - **Clipboard mode:** works with a copied YouTube or Spotify link
-- **Settings window** for every default, plus "Start with Windows"
+- **Settings window** for every default, plus "Start with Windows"; to change the shortcut, click its box and press the new keys
 - **Modern look** with rounded controls; follows the Windows light or dark mode setting
 - **Self-contained:** downloads [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [ffmpeg](https://ffmpeg.org) once, on first run, and checks yt-dlp for updates at each start. Damaged or half-finished downloads of these tools are detected and fetched again
 
@@ -19,7 +19,9 @@ A small Windows tray app: press a keyboard shortcut while a YouTube video or Spo
 
 1. Download `MediaGrab.exe` from [Releases](../../releases) (or build it, below).
 2. Double-click it. The first run downloads yt-dlp and ffmpeg (about 130 MB, one time).
-3. Use the tray icon (red circle) to open Downloads and Settings, or to exit.
+3. Use the tray icon (red circle) to open Downloads and Settings, download a copied link, or exit.
+
+Starting a newer MediaGrab closes the one that is running. If something goes wrong, `%LOCALAPPDATA%\MediaGrab\log.txt` shows what happened.
 
 Windows SmartScreen may warn about an unsigned app: click **More info**, then **Run anyway**.
 
@@ -45,7 +47,7 @@ This produces `MediaGrab.exe` in the repository folder.
 
 ## Automatic build and releases
 
-Every change to `main` is built and tested on Windows by GitHub Actions (`.github/workflows/build.yml`). The test downloads yt-dlp and ffmpeg, tries a download, and takes screenshots of every window in light and dark mode. The exe and screenshots can be downloaded from the run's page under **Artifacts**.
+Every change to `main` is built and tested on Windows by GitHub Actions (`.github/workflows/build.yml`). The test downloads yt-dlp and ffmpeg, tries a download, presses the keyboard shortcut, changes it in Settings, and takes screenshots of every window in light mode and in dark mode at 150% size. The exe and screenshots can be downloaded from the run's page under **Artifacts**; the screenshots and results are also kept on the `ci-screenshots` branch.
 
 To publish a new version:
 

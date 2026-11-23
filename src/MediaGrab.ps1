@@ -4,10 +4,30 @@ param([string]$ExePath)
 # Keep this file plain ASCII: Windows PowerShell reads it without a byte-order mark.
 
 $Version = '1.0.0'
-$Mutex = New-Object Threading.Mutex($false, 'MediaGrab-SingleInstance')
-if (-not $Mutex.WaitOne(0)) { exit }   # already running
 $App = "$env:LOCALAPPDATA\MediaGrab"
-Add-Type -AssemblyName System.Windows.Forms, System.Drawing, UIAutomationClient, UIAutomationTypes
+New-Item $App -ItemType Directory -Force | Out-Null
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+
+# A short diary of what MediaGrab did, to track down problems: %LOCALAPPDATA%\MediaGrab\log.txt
+$LogFile = "$App\log.txt"
+try { if ((Get-Item $LogFile -ErrorAction Ignore).Length -gt 500KB) { Move-Item $LogFile "$LogFile.old" -Force } } catch { }
+function Log($text) { try { Add-Content -LiteralPath $LogFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $text" -Encoding UTF8 } catch { } }
+
+# Only one MediaGrab at a time. A newly started copy asks the running one to close, then takes over.
+$Mutex = New-Object Threading.Mutex($false, 'MediaGrab-SingleInstance')
+$QuitEvent = New-Object Threading.EventWaitHandle($false, 'AutoReset', 'MediaGrab-Quit')
+function Get-Mutex($ms) { try { $Mutex.WaitOne($ms) } catch { $true } }   # an abandoned mutex (a copy that crashed) counts as ours
+if (-not (Get-Mutex 0)) {
+    [void]$QuitEvent.Set()
+    if (-not (Get-Mutex 8000)) {
+        Log 'Another MediaGrab is running and did not close'
+        [void][Windows.Forms.MessageBox]::Show("An older MediaGrab is still running.`n`nRight-click the red MediaGrab icon next to the clock, choose Exit, then start MediaGrab again.", 'MediaGrab', 'OK', 'Information', 'Button1', 'DefaultDesktopOnly')
+        exit
+    }
+}
+[void]$QuitEvent.Reset()
+$Error.Clear()
+Log "MediaGrab $Version started"
 
 # Window controls, written in C#. Compiled once and kept as a DLL, so later starts are faster.
 $UiCode = @'
@@ -27,6 +47,11 @@ public class Hotkey : NativeWindow {
         UnregisterHotKey(Handle, 1); return RegisterHotKey(Handle, 1, mod | 0x4000, vk);
     }
     public void Unregister() { if (Handle != IntPtr.Zero) UnregisterHotKey(Handle, 1); }
+    [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+    public static void Tap(byte[] keys) {   // presses keys like a person (used by the self-test)
+        foreach (byte k in keys) keybd_event(k, 0, 0, UIntPtr.Zero);
+        for (int i = keys.Length - 1; i >= 0; i--) keybd_event(keys[i], 0, 2, UIntPtr.Zero);
+    }
     protected override void WndProc(ref Message m) { if (m.Msg == 0x312 && Pressed != null) Pressed(this, null); base.WndProc(ref m); }
 }
 
@@ -152,6 +177,7 @@ public class MgSegments : Control {
     public event EventHandler Changed;
     public MgSegments() {
         SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        SetStyle(ControlStyles.Selectable, false); TabStop = false;
         Cursor = Cursors.Hand; Height = 32; Track = Color.Gainsboro; Pill = Color.White; PillText = Color.Black; Sub = Color.DimGray;
     }
     public string[] Items { get { return items; } set { items = value ?? new string[0]; sel = items.Length > 0 ? 0 : -1; Invalidate(); } }
@@ -195,6 +221,7 @@ public class MgThumb : Control {
     public Color Empty { get; set; }
     public MgThumb() {
         SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        SetStyle(ControlStyles.Selectable, false); TabStop = false;
         Crop = true; Empty = Color.Gainsboro;
     }
     public void ClearImage() { current = null; img = null; Invalidate(); }
@@ -312,7 +339,6 @@ function Import-Ui {
     $hash = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($UiCode))).Replace('-', '').Substring(0, 12)
     $dll  = "$App\ui-$hash.dll"   # the name changes whenever the code changes
     if (-not (Test-Path $dll)) {
-        New-Item $App -ItemType Directory -Force | Out-Null
         Get-ChildItem "$App\ui-*.dll" | Remove-Item -Force -ErrorAction Ignore   # left over from older versions
         $tmp = "$env:TEMP\mediagrab-ui-$hash-$PID.dll"
         $opt = New-Object CodeDom.Compiler.CompilerParameters -Property @{ OutputAssembly = $tmp; GenerateInMemory = $false }
@@ -325,6 +351,7 @@ function Import-Ui {
 }
 try { Import-Ui }
 catch {   # could not use the saved copy: compile in memory this time
+    Log "Window controls: $_"
     Get-ChildItem "$App\ui-*.dll" -ErrorAction Ignore | Remove-Item -Force -ErrorAction Ignore
     Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition $UiCode
 }
@@ -344,13 +371,20 @@ $C = [ordered]@{
     StartTime = ''; EndTime = ''; FileName = ''; MatchTolerance = '3'; Browsers = 'chrome, msedge, firefox, brave, opera, vivaldi'
 }
 if (Test-Path $CfgFile) {   # a damaged settings file falls back to the defaults
-    try { (Get-Content $CfgFile -Raw -Encoding UTF8 | ConvertFrom-Json).PSObject.Properties | Where-Object { $C.Contains($_.Name) } | ForEach-Object { $C[$_.Name] = "$($_.Value)" } } catch { }
+    try { (Get-Content $CfgFile -Raw -Encoding UTF8 | ConvertFrom-Json).PSObject.Properties | Where-Object { $C.Contains($_.Name) -and "$($_.Value)" -ne '' -or $_.Name -in 'StartTime', 'EndTime', 'FileName' } | ForEach-Object { $C[$_.Name] = "$($_.Value)" } }
+    catch { Log "Settings file could not be read: $_" }
 }
-function Save-Config { New-Item $App -ItemType Directory -Force | Out-Null; $C | ConvertTo-Json | Set-Content $CfgFile -Encoding UTF8 }
+function Save-Config { $C | ConvertTo-Json | Set-Content $CfgFile -Encoding UTF8 }
 
 $S   = @{ Active = [Collections.ArrayList]@() }
-$UIA = [Windows.Automation.AutomationElement]
 $Dot = "   $([char]0xB7)   "
+$ErrorLog = [Collections.ArrayList]@()
+# Moves script errors into the log file (and a list the self-test reads)
+function Flush-Errors {
+    if ($Error.Count -eq 0) { return }
+    foreach ($er in @($Error)) { $text = "$er  [line $($er.InvocationInfo.ScriptLineNumber)]"; [void]$ErrorLog.Add($text); Log "Error: $text" }
+    $Error.Clear()
+}
 
 # ============================ Look and feel ============================
 # Follows the Windows light / dark app setting
@@ -362,7 +396,7 @@ $Palette = if ($Dark) {
        Track = '#2A2C31'; Pill = '#43464D'; Btn = '#2E3036'; BtnHover = '#3A3D44'; Primary = '#ECEDEF'; PrimaryHover = '#D2D4D8'; PrimaryText = '#16171A'
        Focus = '#5B9BFF'; Sel = '#2D3340'; Good = '#4ADE80'; Bad = '#F87171' }
 } else {
-    @{ Bg = '#F4F5F7'; Card = '#FFFFFF'; Field = '#FFFFFF'; Border = '#D5D8DE'; Line = '#ECEEF1'; Text = '#1A1C20'; Sub = '#5F6670'; Faint = '#959BA3'
+    @{ Bg = '#F4F5F7'; Card = '#FFFFFF'; Field = '#FFFFFF'; Border = '#D5D8DE'; Line = '#E3E5E9'; Text = '#1A1C20'; Sub = '#5F6670'; Faint = '#959BA3'
        Track = '#E6E8EC'; Pill = '#FFFFFF'; Btn = '#E6E8EC'; BtnHover = '#DADDE2'; Primary = '#1A1C20'; PrimaryHover = '#363940'; PrimaryText = '#FFFFFF'
        Focus = '#2563EB'; Sel = '#EAF0FC'; Good = '#15803D'; Bad = '#C62828' }
 }
@@ -383,20 +417,12 @@ $Fonts = @{
     Title  = New-Font 15 $true
 }
 $CtlH = [math]::Max((Px 36), $Fonts.Base.Height + (Px 14))   # height of boxes, buttons and switches
+Log "Display scale $([math]::Round($Z, 2)), $(if ($Dark) { 'dark' } else { 'light' }) mode"
 
 # ============================ Helpers =============================
-function Get-TabUrl($hwnd) {
-    $win = $UIA::FromHandle($hwnd)
-    if ((Get-Process -Id $win.Current.ProcessId).Name -notin ($C.Browsers -split '\s*,\s*')) { return }
-    $edit = $win.FindFirst('Descendants', (New-Object Windows.Automation.PropertyCondition($UIA::ControlTypeProperty, [Windows.Automation.ControlType]::Edit)))
-    $url  = $edit.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value
-    if ($url -notmatch '^\w+://') { $url = "https://$url" }
-    $url
-}
-
 function Get-Kind($url) {
     if ($url -match '^https?://([\w-]+\.)*(youtube\.com|youtu\.be)/') { 'youtube' }
-    elseif ($url -match '^https?://open\.spotify\.com/(intl-\w+/)?track/') { 'spotify' }
+    elseif ($url -match '^https?://open\.spotify\.com/(intl-[\w-]+/)?track/') { 'spotify' }
 }
 
 # Starts yt-dlp hidden. Returns the process (P) and its error output (Err), read in the background.
@@ -420,38 +446,38 @@ function Format-Len($sec) { if (-not $sec) { return '?' }; $t = [TimeSpan]::From
 function Notify($title, $text) { $text = "$text"; if ($text.Length -gt 250) { $text = $text.Substring(0, 247) + '...' }; $Tray.ShowBalloonTip(3000, $title, $text, 'Info') }
 function Test-Time($t) { -not $t -or $t -match '^\d+(:\d{1,2}){0,2}(\.\d+)?$' }
 function Open-Dir($dir) { New-Item $dir -ItemType Directory -Force | Out-Null; Start-Process explorer "`"$dir`"" }
-function Add-Ctl($form, $type, $props) {
+function Add-Ctl($parent, $type, $props) {
     $name = if ($type -like 'Mg*') { $type } else { "Windows.Forms.$type" }
-    $c = New-Object $name -Property $props; $form.Controls.Add($c); $c
+    $c = New-Object $name -Property $props; $parent.Controls.Add($c); $c
 }
 # Everything below takes positions in real pixels; sizes come from Px (scaled) or measured text
 function TextW($text, $font) { [Windows.Forms.TextRenderer]::MeasureText("$text", $font).Width }
-function Add-Label($form, $text, $x, $y, $props = @{}) {
-    $p = @{ Text = $text; Location = New-Object Drawing.Point($x, $y); AutoSize = $true; ForeColor = $T.Sub }
+function Add-Label($parent, $text, $x, $y, $props = @{}) {
+    $p = @{ Text = $text; Location = New-Object Drawing.Point($x, $y); AutoSize = $true; ForeColor = $T.Sub; UseMnemonic = $false }
     foreach ($k in $props.Keys) { $p[$k] = $props[$k] }
-    Add-Ctl $form Label $p
+    Add-Ctl $parent Label $p
 }
 # A label centred on a row of boxes that starts at $y
-function Add-RowLabel($form, $text, $x, $y, $props = @{}) {
-    $l = Add-Label $form $text $x $y $props
+function Add-RowLabel($parent, $text, $x, $y, $props = @{}) {
+    $l = Add-Label $parent $text $x $y $props
     $l.Top = $y + [int](($CtlH - $l.PreferredHeight) / 2); $l
 }
-function Add-Field($form, $x, $y, $w) {
-    $f = Add-Ctl $form MgField @{ Location = New-Object Drawing.Point($x, $y); Size = New-Object Drawing.Size($w, $CtlH); Border = $T.Border; FocusColor = $T.Focus; Fill = $T.Field }
+function Add-Field($parent, $x, $y, $w) {
+    $f = Add-Ctl $parent MgField @{ Location = New-Object Drawing.Point($x, $y); Size = New-Object Drawing.Size($w, $CtlH); Border = $T.Border; FocusColor = $T.Focus; Fill = $T.Field }
     $f.Box.ForeColor = $T.Text; $f.Box.Font = $Fonts.Base
     $f.Box
 }
 function ButtonW($text, $min = 90) { [math]::Max((Px $min), (TextW $text $Fonts.Button) + (Px 36)) }
-function Add-Button($form, $text, $x, $y, $w = 0, $style = 'neutral') {
+function Add-Button($parent, $text, $x, $y, $w = 0, $style = 'neutral') {
     if (-not $w) { $w = ButtonW $text }
     $fill, $hover, $fg = if ($style -eq 'primary') { $T.Primary, $T.PrimaryHover, $T.PrimaryText } else { $T.Btn, $T.BtnHover, $T.Text }
-    Add-Ctl $form MgButton @{ Text = $text; Location = New-Object Drawing.Point($x, $y); Size = New-Object Drawing.Size($w, $CtlH)
+    Add-Ctl $parent MgButton @{ Text = $text; Location = New-Object Drawing.Point($x, $y); Size = New-Object Drawing.Size($w, $CtlH)
         Fill = $fill; Hover = $hover; ForeColor = $fg; Font = $Fonts.Button }
 }
 # Width a row of options needs so every word fits
 function SegW($items) { $items.Count * (($items | ForEach-Object { TextW $_ $Fonts.Base } | Measure-Object -Maximum).Maximum + (Px 22)) + (Px 6) }
-function Add-Segments($form, $items, $x, $y, $w) {
-    $s = Add-Ctl $form MgSegments @{ Location = New-Object Drawing.Point($x, $y); Size = New-Object Drawing.Size([math]::Max($w, (SegW $items)), $CtlH)
+function Add-Segments($parent, $items, $x, $y, $w) {
+    $s = Add-Ctl $parent MgSegments @{ Location = New-Object Drawing.Point($x, $y); Size = New-Object Drawing.Size([math]::Max($w, (SegW $items)), $CtlH)
         Track = $T.Track; Pill = $T.Pill; PillText = $T.Text; Sub = $T.Sub; ForeColor = $T.Text; Font = $Fonts.Base }
     $s.Items = [string[]]$items
     $s
@@ -464,30 +490,52 @@ function New-Window($title, $w, $h, [switch]$Sizable) {
     if ($Dark) { $f.Add_HandleCreated({ [MgUi]::DarkTitle($this.Handle) }) }
     $f
 }
-# Keeps a window on the screen: shrinks it and adds a scroll bar if it is too tall
-function Fit-Screen($form) {
-    $max = [Windows.Forms.Screen]::PrimaryScreen.WorkingArea.Height - (Px 80)
-    if ($form.Height -gt $max) {
-        $form.AutoScroll = $true
-        $form.ClientSize = New-Object Drawing.Size(($form.ClientSize.Width + [Windows.Forms.SystemInformation]::VerticalScrollBarWidth), ($form.ClientSize.Height - ($form.Height - $max)))
-    }
+# The part of a window above its buttons. It gets a scroll bar when the screen is too small,
+# while the buttons stay in place below it.
+function New-Page($form, $w) {
+    $p = New-Object Windows.Forms.Panel -Property @{ Location = New-Object Drawing.Point(0, 0); Size = New-Object Drawing.Size($w, 100); BackColor = $T.Bg }
+    $form.Controls.Add($p); $p
+}
+function Fit-Page($form, $page, $contentH, $barH) {
+    $chrome = $form.Height - $form.ClientSize.Height   # title bar and borders
+    $max = [Windows.Forms.Screen]::PrimaryScreen.WorkingArea.Height - (Px 40) - $chrome - $barH
+    $w = $page.Width
+    if ($contentH -gt $max) {
+        $page.AutoScroll = $true
+        $w += [Windows.Forms.SystemInformation]::VerticalScrollBarWidth
+        $page.Size = New-Object Drawing.Size($w, $max)
+    } else { $page.Size = New-Object Drawing.Size($w, $contentH) }
+    $form.ClientSize = New-Object Drawing.Size($w, ($page.Height + $barH))
+    [void](Add-Ctl $form Panel @{ Location = New-Object Drawing.Point(0, $page.Height); Size = New-Object Drawing.Size($w, 1); BackColor = $T.Line })
+}
+# A message on top of everything (MediaGrab has no main window to show it over)
+function Show-Message($text, $owner) {
+    if ($owner) { [void][Windows.Forms.MessageBox]::Show($owner, $text, 'MediaGrab') }
+    else { [void][Windows.Forms.MessageBox]::Show($text, 'MediaGrab', 'OK', 'Information', 'Button1', 'DefaultDesktopOnly') }
 }
 
+# Registers the global keyboard shortcut, e.g. 'Ctrl+Alt+Y'. Returns $false if it is invalid or taken.
 function Set-Hotkey($text) {
-    $keys = $text -split '\s*\+\s*'; $mods = 0
-    foreach ($k in $keys[0..($keys.Count - 2)]) { $m = @{ Alt = 1; Ctrl = 2; Shift = 4; Win = 8 }[$k]; if (-not $m) { return $false }; $mods += $m }
+    $keys = "$text" -split '\s*\+\s*'
+    if ($keys.Count -lt 2) { return $false }
+    $mods = 0
+    foreach ($k in $keys[0..($keys.Count - 2)]) { $m = @{ Alt = 1; Ctrl = 2; Shift = 4; Win = 8 }[$k]; if (-not $m) { return $false }; $mods = $mods -bor $m }
+    if (-not ($mods -band 11)) { return $false }   # needs Ctrl, Alt or Win
     $key = if ($keys[-1] -match '^\d$') { "D$($keys[-1])" } else { $keys[-1] }
-    try { $vk = [int][Windows.Forms.Keys]$key } catch { return $false }
-    if ($mods -eq 0 -or $mods -eq 4) { return $false }   # needs Ctrl, Alt or Win
-    $Tray.Text = "MediaGrab ($text)"
-    $List.EmptyText = "No downloads yet.`nPress $text on a YouTube video or Spotify song to start."
-    $List.Invalidate()
-    $hk.Register($mods, $vk)
+    try { $vk = [int][Windows.Forms.Keys]$key } catch { $Error.RemoveAt(0); return $false }
+    $ok = $hk.Register($mods, $vk)
+    if ($ok) {
+        $Tray.Text = "MediaGrab ($text)"
+        $List.EmptyText = "No downloads yet.`nPress $text on a YouTube video or Spotify song to start."
+        $List.Invalidate()
+    }
+    $ok
 }
 
 # ========== Setup: download yt-dlp + ffmpeg the first time, then only check yt-dlp for updates ==========
 function Start-Setup {
-    $S.FirstRun = -not (Test-Tools)
+    $S.FirstRun = -not (Test-Tools); $S.SetupError = $null; $S.SetupStart = Get-Date
+    Log "Setup started ($(if ($S.FirstRun) { 'downloading yt-dlp and ffmpeg' } else { 'checking yt-dlp for updates' }))"
     $S.Setup = Start-Job -ArgumentList $Bin -ScriptBlock {
         param($bin)
         $ErrorActionPreference = 'Stop'
@@ -566,11 +614,10 @@ function Set-Status($e, $text, $pct = $null) {
 function Get-Entries { $List.Items | ForEach-Object Tag }
 function Save-History {
     $h = @(Get-Entries | Where-Object { $_.Status -eq 'Done' } | Select-Object -First 500 | ForEach-Object { [ordered]@{ Name = $_.Name; Path = $_.Path; Dir = $_.Dir; Key = $_.Key; Date = $_.Date } })
-    New-Item $App -ItemType Directory -Force | Out-Null
     ConvertTo-Json -InputObject $h | Set-Content $HistFile -Encoding UTF8
 }
 function Show-InFolder($e) {
-    if ($e.Error) { [void][Windows.Forms.MessageBox]::Show($D, "$($e.Name)`n`n$($e.Error)", 'Download failed'); return }
+    if ($e.Error) { Show-Message "$($e.Name)`n`n$($e.Error)" $D; return }
     if ($e.Path -and (Test-Path -LiteralPath $e.Path)) { Start-Process explorer "/select,`"$($e.Path)`"" } else { Open-Dir $e.Dir }
 }
 $ShowBtn.Add_Click({ if ($List.SelectedItems.Count) { Show-InFolder $List.SelectedItems[0].Tag } })
@@ -584,7 +631,7 @@ if (Test-Path $HistFile) {   # a damaged history file is ignored
     try {
         $old = @((Get-Content $HistFile -Raw -Encoding UTF8 | ConvertFrom-Json) | ForEach-Object { $_ }); [array]::Reverse($old)
         foreach ($h in $old) { if ($h) { Add-Entry @{ Name = $h.Name; Path = $h.Path; Dir = $h.Dir; Key = $h.Key; Date = $h.Date; Status = 'Done' } } }
-    } catch { }
+    } catch { Log "History file could not be read: $_" }
 }
 
 # ========================= Download window ========================
@@ -595,41 +642,42 @@ $CW  = [math]::Max((Px 500), [math]::Max((SegW $Choices.Format), (SegW $Choices.
 $X0  = $M + $LW; $FW = $X0 + $CW + $M                                                                       # window width
 $F = New-Window 'MediaGrab' $FW (Px 500)
 $F.TopMost = $true
+$FP = New-Page $F $FW
 $thumbW = Px 208; $thumbH = Px 117; $HX = $M + $thumbW + (Px 16); $HW = $FW - $M - $HX
-$U = @{ Pic = Add-Ctl $F MgThumb @{ Location = New-Object Drawing.Point($M, $M); Size = New-Object Drawing.Size($thumbW, $thumbH); Empty = $T.Track } }
-$U.Title = Add-Ctl $F Label @{ Location = New-Object Drawing.Point($HX, ($M - (Px 3))); Size = New-Object Drawing.Size($HW, ($Fonts.Title.Height * 2 + (Px 4)))
+$U = @{ Pic = Add-Ctl $FP MgThumb @{ Location = New-Object Drawing.Point($M, $M); Size = New-Object Drawing.Size($thumbW, $thumbH); Empty = $T.Track } }
+$U.Title = Add-Ctl $FP Label @{ Location = New-Object Drawing.Point($HX, ($M - (Px 3))); Size = New-Object Drawing.Size($HW, ($Fonts.Title.Height * 2 + (Px 4)))
     AutoEllipsis = $true; Font = $Fonts.Title; ForeColor = $T.Text; UseMnemonic = $false }
-$U.Info  = Add-Ctl $F Label @{ Location = New-Object Drawing.Point($HX, ($U.Title.Bottom + (Px 2))); Size = New-Object Drawing.Size($HW, ($Fonts.Base.Height + (Px 4)))
+$U.Info  = Add-Ctl $FP Label @{ Location = New-Object Drawing.Point($HX, ($U.Title.Bottom + (Px 2))); Size = New-Object Drawing.Size($HW, ($Fonts.Base.Height + (Px 4)))
     AutoEllipsis = $true; ForeColor = $T.Sub; UseMnemonic = $false }
 $y = $U.Info.Bottom + (Px 4)
-$U.Match = Add-Ctl $F ComboBox @{ Location = New-Object Drawing.Point($HX, $y); Width = $HW; DropDownStyle = 'DropDownList'; FlatStyle = 'Flat'
+$U.Match = Add-Ctl $FP ComboBox @{ Location = New-Object Drawing.Point($HX, $y); Width = $HW; DropDownStyle = 'DropDownList'; FlatStyle = 'Flat'
     BackColor = $T.Field; ForeColor = $T.Text; Font = $Fonts.Base }
-$U.Url   = Add-Ctl $F Label @{ Location = New-Object Drawing.Point($HX, $y); Size = New-Object Drawing.Size($HW, ($Fonts.Url.Height + (Px 4)))
+$U.Url   = Add-Ctl $FP Label @{ Location = New-Object Drawing.Point($HX, $y); Size = New-Object Drawing.Size($HW, ($Fonts.Url.Height + (Px 4)))
     AutoEllipsis = $true; ForeColor = $T.Faint; Font = $Fonts.Url; UseMnemonic = $false }
 $y = [math]::Max(($M + $thumbH), $U.Match.Bottom) + (Px 16)
-[void](Add-Ctl $F Panel @{ Location = New-Object Drawing.Point($M, $y); Size = New-Object Drawing.Size(($FW - 2 * $M), 1); BackColor = $T.Line })
+[void](Add-Ctl $FP Panel @{ Location = New-Object Drawing.Point($M, $y); Size = New-Object Drawing.Size(($FW - 2 * $M), 1); BackColor = $T.Line })
 $y += Px 16
 $rowY = @{}
-foreach ($n in $rowNames) { $rowY[$n] = $y; [void](Add-RowLabel $F $n $M $y @{ Font = $Fonts.Small }); $y += $CtlH + $RowGap }
-$U.Type  = Add-Segments $F $Choices.Format $X0 $rowY['FILE TYPE'] $CW
-$U.VQ    = Add-Segments $F $Choices.VideoQuality $X0 $rowY['VIDEO'] $CW
+foreach ($n in $rowNames) { $rowY[$n] = $y; [void](Add-RowLabel $FP $n $M $y @{ Font = $Fonts.Small }); $y += $CtlH + $RowGap }
+$U.Type  = Add-Segments $FP $Choices.Format $X0 $rowY['FILE TYPE'] $CW
+$U.VQ    = Add-Segments $FP $Choices.VideoQuality $X0 $rowY['VIDEO'] $CW
 $toW     = TextW 'to' $Fonts.Base
 $trimW   = [int](($CW - $toW - 2 * $G) / 2)
-$U.Start = Add-Field $F $X0 $rowY['TRIM'] $trimW
-[void](Add-RowLabel $F 'to' ($X0 + $trimW + $G) $rowY['TRIM'])
-$U.End   = Add-Field $F ($X0 + $CW - $trimW) $rowY['TRIM'] $trimW
+$U.Start = Add-Field $FP $X0 $rowY['TRIM'] $trimW
+[void](Add-RowLabel $FP 'to' ($X0 + $trimW + $G) $rowY['TRIM'])
+$U.End   = Add-Field $FP ($X0 + $CW - $trimW) $rowY['TRIM'] $trimW
 $browseW = ButtonW 'Browse'
-$U.Dir   = Add-Field $F $X0 $rowY['SAVE TO'] ($CW - $browseW - $G)
-$Browse  = Add-Button $F 'Browse' ($X0 + $CW - $browseW) $rowY['SAVE TO'] $browseW
+$U.Dir   = Add-Field $FP $X0 $rowY['SAVE TO'] ($CW - $browseW - $G)
+$Browse  = Add-Button $FP 'Browse' ($X0 + $CW - $browseW) $rowY['SAVE TO'] $browseW
 $extW    = (TextW '.flac' $Fonts.Base) + (Px 8)
-$U.Name  = Add-Field $F $X0 $rowY['FILE NAME'] ($CW - $extW - $G)
-$U.Ext   = Add-RowLabel $F '.mp3' ($X0 + $CW - $extW) $rowY['FILE NAME']
-$y += Px 12
+$U.Name  = Add-Field $FP $X0 $rowY['FILE NAME'] ($CW - $extW - $G)
+$U.Ext   = Add-RowLabel $FP '.mp3' ($X0 + $CW - $extW) $rowY['FILE NAME']
+$barH = (Px 14) + $CtlH + $M
+Fit-Page $F $FP ($y - $RowGap + (Px 10)) $barH
+$by = $FP.Bottom + (Px 14)
 $goW = ButtonW 'Download' 110; $closeW = ButtonW 'Close'
-$U.Go    = Add-Button $F 'Download' ($FW - $M - $goW) $y $goW
-$U.Close = Add-Button $F 'Close' ($U.Go.Left - $G - $closeW) $y $closeW
-$F.ClientSize = New-Object Drawing.Size($FW, ($U.Go.Bottom + $M))
-Fit-Screen $F
+$U.Go    = Add-Button $F 'Download' ($F.ClientSize.Width - $M - $goW) $by $goW
+$U.Close = Add-Button $F 'Close' ($U.Go.Left - $G - $closeW) $by $closeW
 $U.Go.ForeColor = 'White'; $U.Close.DialogResult = 'Cancel'
 $U.Type.Add_Changed({ $U.Ext.Text = ".$($U.Type.Value)"; $U.VQ.Enabled = $U.Type.Value -eq 'mp4' })
 $F.AcceptButton = $U.Go
@@ -663,7 +711,7 @@ function Start-Download {
     $from, $to, $dir, $name = ($U.Start, $U.End, $U.Dir, $U.Name).Text.Trim()
     if (-not $from) { $from = $C.StartTime }; if (-not $to) { $to = $C.EndTime }
     if (-not $dir)  { $dir = $C.SaveDir };    if (-not $name) { $name = if ($C.FileName) { $C.FileName } else { $S.Name } }
-    foreach ($t in $from, $to) { if (-not (Test-Time $t)) { [void][Windows.Forms.MessageBox]::Show($F, "'$t' is not a valid time. Use 90 or 1:30.", 'MediaGrab'); return } }
+    foreach ($t in $from, $to) { if (-not (Test-Time $t)) { Show-Message "'$t' is not a valid time. Use 90 or 1:30." $F; return } }
 
     $key = if ($S.Kind -eq 'spotify') { $S.Url -replace '\?.*' } else { $S.Target -replace '&.*' }
     $dup = Get-Entries | Where-Object { $_.Key -eq $key -and $_.Status -eq 'Done' } | Select-Object -First 1
@@ -680,74 +728,64 @@ function Start-Download {
     $out   = if ($clean) { $clean -replace '%', '%%' } else { '%(title)s' }
     $dir   = $dir.TrimEnd('\')
     try { New-Item $dir -ItemType Directory -Force -ErrorAction Stop | Out-Null }
-    catch { [void][Windows.Forms.MessageBox]::Show($F, "Cannot use the folder '$dir'.`n$($_.Exception.Message)", 'MediaGrab'); return }
+    catch { Show-Message "Cannot use the folder '$dir'.`n$($_.Exception.Message)" $F; return }
 
     try { $run = Start-YtDlp "$type $info $cut --no-playlist --newline --progress-template `"download:P|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s`" -o `"$dir\$out.%(ext)s`" `"$($S.Target)`"" }
-    catch { [void][Windows.Forms.MessageBox]::Show($F, "yt-dlp could not start: $($_.Exception.Message)", 'MediaGrab'); return }
+    catch { Show-Message "yt-dlp could not start: $($_.Exception.Message)" $F; return }
     $e = @{ Name = $(if ($clean) { "$clean.$fmt" } else { $S.Name }); Path = $(if ($clean) { "$dir\$clean.$fmt" }); Dir = $dir; Key = $key
             Date = Get-Date -Format 'yyyy-MM-dd HH:mm'; Status = 'Starting...'; P = $run.P; Err = $run.Err }
     $e.Line = $e.P.StandardOutput.ReadLineAsync()
     Add-Entry $e; [void]$S.Active.Add($e)
+    Log "Download started: $($e.Name) ($($S.Target))"
     $S.Started = $true
     $F.DialogResult = 'OK'   # ends the dialog without destroying the window
 }
 $U.Go.Add_Click({ Start-Download })
 
-# Fills in details once yt-dlp answers (for Spotify: lists YouTube results, picks the one closest in length)
-$Poll = New-Object Windows.Forms.Timer -Property @{ Interval = 250 }
-$Poll.Add_Tick({
-    if ($S.Page) {   # Spotify: page downloaded in the background
-        if (-not $S.Page.IsCompleted) { return }
-        $task = $S.Page; $S.Page = $null
-        Read-SpotifyPage $(if ($task.Status -eq 'RanToCompletion') { $task.Result })
-        if (-not $S.SpTitle) { $Poll.Stop(); Show-Problem 'Could not read this Spotify song' 'Check your internet connection and try again.'; return }
-        $S.Name = $U.Title.Text = $(if ($S.SpArtist) { "$($S.SpArtist) - $($S.SpTitle)" } else { $S.SpTitle })
-        $U.Info.Text = 'Finding the song on YouTube...'
-        $q = $S.Name -replace '"'
-        Start-Lookup "--flat-playlist -i --playlist-items 1:5 $Fields `"https://music.youtube.com/search?q=$([Uri]::EscapeDataString($q))#songs`" `"ytsearch5:$q`""
-        return
-    }
-    if (-not ($S.Meta.IsCompleted -and $S.MetaErr.IsCompleted)) { return }
-    $Poll.Stop()
-    $seen = @{}
-    $S.Found = @($S.Meta.Result -split "`r?`n" | Where-Object { $_ } | ForEach-Object {
-        $id, $dur, $title = $_ -split '\|', 3; $dur = $dur -as [double]
-        [pscustomobject]@{ Id = $id; Dur = $dur; Title = $title; Diff = $(if ($dur -and $S.SpDur) { [math]::Abs($dur - $S.SpDur) } else { 1e9 }) }
-    } | Where-Object { -not $seen[$_.Id] -and ($seen[$_.Id] = 1) })
-    if (-not $S.Found) {
-        $why = Get-YtError $S.MetaErr
-        if ($S.Kind -eq 'youtube') { $U.Title.Text = 'Not available' }
-        $U.Info.Text = if ($why) { $why } else { 'Could not find this online.' }
-        $U.Info.ForeColor = $T.Bad; $U.Go.Enabled = $false
-        return
-    }
-    $best = @($S.Found | Where-Object { $_.Diff -le [double]$C.MatchTolerance })[0]    # first result with matching length
-    if (-not $best) { $best = $S.Found | Sort-Object Diff | Select-Object -First 1 }
-    if ($S.Kind -eq 'spotify') {
-        $U.Info.Text = "Spotify length $(Format-Len $S.SpDur)$($Dot)YouTube match (change if wrong):"
-        $U.Url.Visible = $false; $U.Match.Visible = $true
-        $U.Match.Items.Clear()
-        foreach ($m in $S.Found) { [void]$U.Match.Items.Add("$($m.Title)  ($(Format-Len $m.Dur))") }
-        $U.Match.SelectedIndex = @(0..($S.Found.Count - 1) | Where-Object { $S.Found[$_].Id -eq $best.Id })[0]
-        $U.Go.Enabled = $true
-    } else {
-        $S.Name = $U.Title.Text = $best.Title
-        Use-Match $best
-        $U.Info.Text = "YouTube$($Dot)$($S.Len)"
-        $U.Pic.LoadUrl("https://i.ytimg.com/vi/$($best.Id)/hqdefault.jpg")
-    }
-})
-
-function Get-Meta($html, $name) { [Net.WebUtility]::HtmlDecode([regex]::Match($html, "$name`" content=`"([^`"]*)").Groups[1].Value) }
-
+# ---- Filling in the download window: setup -> link -> details (all without freezing the window) ----
 $Fields = '--print "%(id)s|%(duration)s|%(title)s"'
+function Get-Meta($html, $name) { [Net.WebUtility]::HtmlDecode([regex]::Match($html, "$name`" content=`"([^`"]*)").Groups[1].Value) }
 
 # Shows what went wrong in the open window
 function Show-Problem($title, $text, $hint = '') {
-    $Poll.Stop()
+    $Load.Stop(); $Poll.Stop()
+    Log "Download window: $title - $text $hint"
     $U.Title.Text = $title; $U.Info.Text = $text; $U.Info.ForeColor = $T.Bad
     $U.Url.Text = $hint; $U.Url.Visible = $true; $U.Match.Visible = $false; $U.Go.Enabled = $false
 }
+
+# Reads the address bar of the browser window that was in front, on a background thread
+$UrlScript = {
+    param($hwnd, $browsers)
+    Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+    $uia = [Windows.Automation.AutomationElement]
+    $win = $uia::FromHandle($hwnd)
+    if ((Get-Process -Id $win.Current.ProcessId).Name -notin ($browsers -split '\s*,\s*')) { return }
+    $edit = $win.FindFirst('Descendants', (New-Object Windows.Automation.PropertyCondition($uia::ControlTypeProperty, [Windows.Automation.ControlType]::Edit)))
+    $url = $edit.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value
+    if ($url -and $url -notmatch '^\w+://') { $url = "https://$url" }
+    $url
+}
+function Start-UrlRead {
+    $ps = [PowerShell]::Create().AddScript($UrlScript.ToString()).AddArgument($S.Fg).AddArgument($C.Browsers)
+    $S.UrlRead = @{ PS = $ps; Result = $ps.BeginInvoke(); Started = Get-Date }
+}
+function Stop-UrlRead {
+    if (-not $S.UrlRead) { return }
+    try { if ($S.UrlRead.Result.IsCompleted) { $S.UrlRead.PS.Dispose() } else { [void]$S.UrlRead.PS.BeginStop($null, $null) } } catch { }
+    $S.UrlRead = $null
+}
+# The address once it has been read: $null while still reading, '' if there is none
+function Get-UrlRead {
+    $r = $S.UrlRead
+    if (-not $r.Result.IsCompleted -and ((Get-Date) - $r.Started).TotalSeconds -lt 6) { return $null }
+    $url = ''
+    if ($r.Result.IsCompleted) { try { $url = "$(@($r.PS.EndInvoke($r.Result))[-1])" } catch { Log "Reading the browser address failed: $_"; $Error.RemoveAt(0) } }
+    else { Log 'Reading the browser address took too long' }
+    Stop-UrlRead
+    $url
+}
+
 # Asks yt-dlp for the id, length and title (in the background)
 function Start-Lookup($query) {
     try { $run = Start-YtDlp $query }
@@ -767,14 +805,11 @@ function Read-SpotifyPage($html) {
     $img = Get-Meta $html 'og:image'
     if ($img) { $U.Pic.LoadUrl($img) }
 }
-
-# Runs right after the window has appeared: finds the link, then starts looking it up
-$Load = New-Object Windows.Forms.Timer -Property @{ Interval = 30 }
-$Load.Add_Tick({
-    $Load.Stop(); $F.Refresh()
-    $url = $null; try { $url = Get-TabUrl $S.Fg } catch { }
-    if (-not (Get-Kind $url)) { try { $url = "$([Windows.Forms.Clipboard]::GetText())".Trim() } catch { } }   # no matching tab: try a copied link
+# Starts looking up a link from the browser or the clipboard
+function Use-Link($url) {
+    if (-not (Get-Kind $url)) { try { $url = "$([Windows.Forms.Clipboard]::GetText())".Trim() } catch { $Error.RemoveAt(0) } }   # no matching tab: try a copied link
     $kind = Get-Kind $url
+    Log "Link: $(if ($kind) { "$kind $url" } else { 'none found' })"
     if (-not $kind) { Show-Problem 'No video or song found' 'Open a YouTube video or Spotify song, or copy its link,' "then press $($C.Hotkey) again."; return }
     $S.Url = $S.Target = $url; $S.Kind = $kind
     $U.Url.Text = $url; $U.Pic.Crop = $kind -eq 'youtube'
@@ -791,10 +826,76 @@ $Load.Add_Tick({
         $U.Go.Enabled = $true
         Start-Lookup "--no-playlist $Fields `"$url`""
     }
+}
+
+# Step 1 and 2, checked several times a second while the window is open:
+# wait until yt-dlp and ffmpeg are ready, then read the browser's address
+$Load = New-Object Windows.Forms.Timer -Property @{ Interval = 100 }
+$Load.Add_Tick({
+    if ($S.Stage -eq 'setup') {
+        if ($S.Setup) { $U.Info.Text = $(if ($S.FirstRun) { 'Downloading yt-dlp and ffmpeg (one time, about a minute)...' } else { 'Checking yt-dlp for updates...' }); return }
+        if (-not (Test-Tools)) {
+            if ($S.SetupError) { Show-Problem 'Setup failed' 'Could not download yt-dlp and ffmpeg. Check your internet and try again.' $S.SetupError; $S.SetupError = $null; return }
+            Start-Setup; return
+        }
+        $U.Info.Text = 'Reading the link from your browser...'
+        Start-UrlRead; $S.Stage = 'url'; return
+    }
+    if ($S.Stage -eq 'url') {
+        $url = Get-UrlRead
+        if ($null -eq $url) { return }
+        $Load.Stop(); $S.Stage = 'lookup'
+        Use-Link $url
+    }
 })
 
-# Opens the download window at once, so it is clear the shortcut worked
+# Step 3: fills in details once Spotify / yt-dlp answer (for Spotify: lists YouTube results, picks the one closest in length)
+$Poll = New-Object Windows.Forms.Timer -Property @{ Interval = 250 }
+$Poll.Add_Tick({
+    if ($S.Page) {   # Spotify page, downloaded in the background
+        if (-not $S.Page.IsCompleted) { return }
+        $task = $S.Page; $S.Page = $null
+        Read-SpotifyPage $(if ($task.Status -eq 'RanToCompletion') { $task.Result })
+        if (-not $S.SpTitle) { Show-Problem 'Could not read this Spotify song' 'Check your internet connection and try again.'; return }
+        $S.Name = $U.Title.Text = $(if ($S.SpArtist) { "$($S.SpArtist) - $($S.SpTitle)" } else { $S.SpTitle })
+        $U.Info.Text = 'Finding the song on YouTube...'
+        $q = $S.Name -replace '"'
+        Start-Lookup "--flat-playlist -i --playlist-items 1:5 $Fields `"https://music.youtube.com/search?q=$([Uri]::EscapeDataString($q))#songs`" `"ytsearch5:$q`""
+        return
+    }
+    if (-not ($S.Meta.IsCompleted -and $S.MetaErr.IsCompleted)) { return }
+    $Poll.Stop()
+    $seen = @{}
+    $S.Found = @($S.Meta.Result -split "`r?`n" | Where-Object { $_ } | ForEach-Object {
+        $id, $dur, $title = $_ -split '\|', 3; $dur = $dur -as [double]
+        [pscustomobject]@{ Id = $id; Dur = $dur; Title = $title; Diff = $(if ($dur -and $S.SpDur) { [math]::Abs($dur - $S.SpDur) } else { 1e9 }) }
+    } | Where-Object { -not $seen[$_.Id] -and ($seen[$_.Id] = 1) })
+    if (-not $S.Found) {
+        $why = Get-YtError $S.MetaErr
+        Show-Problem $(if ($S.Kind -eq 'youtube') { 'Not available' } else { $U.Title.Text }) $(if ($why) { $why } else { 'Could not find this on YouTube.' }) $S.Url
+        return
+    }
+    $best = @($S.Found | Where-Object { $_.Diff -le [double]$C.MatchTolerance })[0]    # first result with matching length
+    if (-not $best) { $best = $S.Found | Sort-Object Diff | Select-Object -First 1 }
+    if ($S.Kind -eq 'spotify') {
+        $U.Info.Text = "Spotify length $(Format-Len $S.SpDur)$($Dot)YouTube match (change if wrong):"
+        $U.Url.Visible = $false; $U.Match.Visible = $true
+        $U.Match.Items.Clear()
+        foreach ($m in $S.Found) { [void]$U.Match.Items.Add("$($m.Title)  ($(Format-Len $m.Dur))") }
+        $U.Match.SelectedIndex = @(0..($S.Found.Count - 1) | Where-Object { $S.Found[$_].Id -eq $best.Id })[0]
+        $U.Go.Enabled = $true
+    } else {
+        $S.Name = $U.Title.Text = $best.Title
+        Use-Match $best
+        $U.Info.Text = "YouTube$($Dot)$($S.Len)"
+        $U.Pic.LoadUrl("https://i.ytimg.com/vi/$($best.Id)/hqdefault.jpg")
+    }
+    Log "Found: $($U.Title.Text)"
+})
+
+# Opens the download window at once, so it is clear the shortcut worked; the rest fills in while it is open
 function Show-Dialog {
+    if ($F.Visible) { $F.Activate(); return }
     $S.Fg = [Hotkey]::GetForegroundWindow()   # the browser, before our window takes its place
     foreach ($k in 'Url', 'Target', 'Kind', 'Name', 'Len', 'SpDur', 'SpTitle', 'SpArtist', 'SpAlbum', 'Started', 'Meta', 'MetaErr', 'Page', 'Found') { $S[$k] = $null }
     foreach ($b in $U.Start, $U.End, $U.Name) { $b.Text = '' }
@@ -804,14 +905,15 @@ function Show-Dialog {
     $U.Title.Text = 'Loading...'; $U.Info.Text = 'Reading the link from your browser...'; $U.Info.ForeColor = $T.Sub
     $U.Url.Text = ''; $U.Url.Visible = $true; $U.Match.Items.Clear(); $U.Match.Visible = $false
     $U.Go.Fill = $T.Primary; $U.Go.Hover = $T.PrimaryHover; $U.Go.Enabled = $false
+    $S.Stage = 'setup'
     $Load.Start()
     [void]$F.ShowDialog()
-    $Load.Stop(); $Poll.Stop()
+    $Load.Stop(); $Poll.Stop(); Stop-UrlRead
     if ($S.Started) { Show-Downloads }
 }
 
 # ========================= Settings window ========================
-function Show-Settings([switch]$Shot) {
+function Show-Settings {
     $rows = @(
         @('#', 'General'), @('Hotkey', 'Keyboard shortcut'), @('SaveDir', 'Download folder'), @('FileName', 'Default file name'), @('Browsers', 'Browsers (comma separated)'),
         @('#', 'Audio and video'), @('Format', 'Default file type'), @('VideoQuality', 'Default video quality'), @('AudioQuality', 'Audio quality (0 best, 10 smallest)'), @('EmbedInfo', 'Add song info and cover art'),
@@ -823,37 +925,38 @@ function Show-Settings([switch]$Shot) {
     $X0 = $M + $LW; $SW = $X0 + $CW + $M
     $W = New-Window 'MediaGrab - Settings' $SW (Px 600)
     $W.TopMost = $true
+    $P = New-Page $W $SW
     $box = @{}; $y = Px 8
     foreach ($r in $rows) {
-        if ($r[0] -eq '#') { [void](Add-Label $W $r[1] $M ($y + (Px 12)) @{ Font = $Fonts.Head; ForeColor = $T.Text }); $y += $Fonts.Head.Height + (Px 22); continue }
+        if ($r[0] -eq '#') { [void](Add-Label $P $r[1] $M ($y + (Px 12)) @{ Font = $Fonts.Head; ForeColor = $T.Text }); $y += $Fonts.Head.Height + (Px 22); continue }
         $k = $r[0]
-        [void](Add-RowLabel $W $r[1] $M $y)
-        if ($Choices[$k]) { $box[$k] = Add-Segments $W $Choices[$k] $X0 $y $CW; $box[$k].Value = $C[$k] }
+        [void](Add-RowLabel $P $r[1] $M $y)
+        if ($Choices[$k]) { $box[$k] = Add-Segments $P $Choices[$k] $X0 $y $CW; $box[$k].Value = $C[$k] }
         elseif ($k -eq 'Hotkey') {
-            $kf = Add-Ctl $W MgKeyField @{ Location = New-Object Drawing.Point($X0, $y); Size = New-Object Drawing.Size($CW, $CtlH); Border = $T.Border; FocusColor = $T.Focus; Fill = $T.Field }
-            $kf.Box.ForeColor = $T.Text; $kf.Box.Font = $Fonts.Base; $kf.Value = $(if ($C.Hotkey) { $C.Hotkey } else { 'Ctrl+Alt+Y' })
+            $kf = Add-Ctl $P MgKeyField @{ Location = New-Object Drawing.Point($X0, $y); Size = New-Object Drawing.Size($CW, $CtlH); Border = $T.Border; FocusColor = $T.Focus; Fill = $T.Field }
+            $kf.Box.ForeColor = $T.Text; $kf.Box.Font = $Fonts.Base; $kf.Value = $C.Hotkey
             $box[$k] = $kf
         }
         elseif ($k -eq 'SaveDir') {
             $bw = ButtonW 'Browse'
-            $box[$k] = Add-Field $W $X0 $y ($CW - $bw - $G); $box[$k].Text = $C[$k]
-            $b = Add-Button $W 'Browse' ($X0 + $CW - $bw) $y $bw; $b.Add_Click({ Pick-Folder $box.SaveDir $W })
+            $box[$k] = Add-Field $P $X0 $y ($CW - $bw - $G); $box[$k].Text = $C[$k]
+            $b = Add-Button $P 'Browse' ($X0 + $CW - $bw) $y $bw; $b.Add_Click({ Pick-Folder $box.SaveDir $W })
         }
-        else { $box[$k] = Add-Field $W $X0 $y $CW; $box[$k].Text = $C[$k] }
+        else { $box[$k] = Add-Field $P $X0 $y $CW; $box[$k].Text = $C[$k] }
         $y += $CtlH + (Px 8)
     }
-    $auto = Add-Ctl $W CheckBox @{ Location = New-Object Drawing.Point($M, ($y + (Px 12))); AutoSize = $true; Text = 'Start MediaGrab when Windows starts'; ForeColor = $T.Text
+    $auto = Add-Ctl $P CheckBox @{ Location = New-Object Drawing.Point($M, ($y + (Px 10))); AutoSize = $true; Text = 'Start MediaGrab when Windows starts'; ForeColor = $T.Text
                                    Enabled = [bool]$ExePath; Checked = [bool](Get-ItemProperty $RunKey -Name MediaGrab -ErrorAction Ignore) }
-    $y = $auto.Bottom + (Px 24)
-    $saveW = ButtonW 'Save'; $cancelW = ButtonW 'Cancel'
-    $save = Add-Button $W 'Save' ($SW - $M - $cancelW - $G - $saveW) $y $saveW 'primary'
-    $W.CancelButton = Add-Button $W 'Cancel' ($SW - $M - $cancelW) $y $cancelW
-    $W.CancelButton.DialogResult = 'Cancel'
-    $W.AcceptButton = $save
+    $barH = (Px 14) + $CtlH + $M
+    Fit-Page $W $P ($auto.Bottom + (Px 16)) $barH
+    $by = $P.Bottom + (Px 14); $right = $W.ClientSize.Width - $M
+    $cancelW = ButtonW 'Cancel'; $saveW = ButtonW 'Save'
+    $cancel = Add-Button $W 'Cancel' ($right - $cancelW) $by $cancelW
+    $save = Add-Button $W 'Save' ($cancel.Left - $G - $saveW) $by $saveW 'primary'
+    $cancel.DialogResult = 'Cancel'
+    $W.CancelButton = $cancel; $W.AcceptButton = $save
     $W.ActiveControl = $save   # don't start inside the shortcut box
-    [void](Add-RowLabel $W "MediaGrab $Version" $M $y @{ ForeColor = $T.Faint })
-    $W.ClientSize = New-Object Drawing.Size($SW, ($y + $CtlH + $M))
-    Fit-Screen $W
+    [void](Add-RowLabel $W "MediaGrab $Version" $M $by @{ ForeColor = $T.Faint })
 
     $save.Add_Click({
         $new = @{}; foreach ($k in $box.Keys) { $new[$k] = if ($box[$k] -is [MgSegments] -or $box[$k] -is [MgKeyField]) { $box[$k].Value } else { $box[$k].Text.Trim() } }
@@ -862,24 +965,20 @@ function Show-Settings([switch]$Shot) {
                elseif (-not ((Test-Time $new.StartTime) -and (Test-Time $new.EndTime))) { 'Times must look like 90 or 1:30.' }
                elseif (-not $new.SaveDir) { 'Choose a download folder.' }
                elseif (-not (Set-Hotkey $new.Hotkey)) { $hk.Unregister(); "The shortcut $($new.Hotkey) is already used by Windows or another program. Click the shortcut box and press a different one." }
-        if ($err) { [void][Windows.Forms.MessageBox]::Show($W, $err, 'MediaGrab'); return }
+        if ($err) { Show-Message $err $W; return }
         foreach ($k in $new.Keys) { $C[$k] = $new[$k] }
         Save-Config
         if ($auto.Checked) { Set-ItemProperty $RunKey MediaGrab "`"$ExePath`"" } else { Remove-ItemProperty $RunKey MediaGrab -ErrorAction Ignore }
+        Log "Settings saved (shortcut $($C.Hotkey))"
         $W.Close()
     })
     $hk.Unregister()   # the shortcut is paused while Settings is open, so it can be pressed in the shortcut box
-    if ($Shot) {
-        Save-Shot $W 'settings'
-        $kf.Box.Focus(); [Windows.Forms.SendKeys]::SendWait('^%k')
-        foreach ($i in 1..10) { [Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 30 }
-        $typed = $kf.Value; $save.PerformClick()
-        Check ($typed -eq 'Ctrl+Alt+K' -and $C.Hotkey -eq 'Ctrl+Alt+K') "Pressing Ctrl+Alt+K in the shortcut box and saving works (box: $typed, saved: $($C.Hotkey))"
-        $C.Hotkey = 'Ctrl+Alt+Y'; Save-Config
-        if (-not $W.IsDisposed) { $W.Close() }
-    } else { [void]$W.ShowDialog() }
+    $script:SettingsUi = @{ W = $W; Key = $kf; Save = $save }
+    [void]$W.ShowDialog()
+    $script:SettingsUi = $null
     $W.Dispose()
-    [void](Set-Hotkey $C.Hotkey)   # make sure the shortcut is active again
+    $ok = Set-Hotkey $C.Hotkey   # turn the (new) shortcut on again
+    Log "Settings closed; shortcut $($C.Hotkey) $(if ($ok) { 'active' } else { 'could not be turned on' })"
 }
 
 # ===================== Tray icon and background work =====================
@@ -887,22 +986,30 @@ $bmp = New-Object Drawing.Bitmap 32, 32; $g = [Drawing.Graphics]::FromImage($bmp
 $g.FillEllipse((New-Object Drawing.SolidBrush $T.YouTube), 1, 1, 30, 30)
 $g.FillPolygon([Drawing.Brushes]::White, [Drawing.Point[]]@('13,6', '19,6', '19,14', '24,14', '16,22', '8,14', '13,14'))
 $g.FillRectangle([Drawing.Brushes]::White, 9, 24, 14, 3)
-$Tray = New-Object Windows.Forms.NotifyIcon -Property @{ Visible = $true; ContextMenuStrip = New-Object Windows.Forms.ContextMenuStrip; Icon = [Drawing.Icon]::FromHandle($bmp.GetHicon()) }
+$Tray = New-Object Windows.Forms.NotifyIcon -Property @{ Visible = $true; Text = 'MediaGrab'; ContextMenuStrip = New-Object Windows.Forms.ContextMenuStrip; Icon = [Drawing.Icon]::FromHandle($bmp.GetHicon()) }
 $Tray.ContextMenuStrip.Font = $Fonts.Base
 $D.Icon = $Tray.Icon; $F.Icon = $Tray.Icon
-foreach ($m in ('Downloads', { Show-Downloads }), ('Settings', { Show-Settings }), ('Open download folder', { Open-Dir $C.SaveDir }), ('Exit', { $Tray.Visible = $false; [Windows.Forms.Application]::Exit() })) {
+function Quit-App { Log 'Closing'; $Tray.Visible = $false; [Windows.Forms.Application]::Exit() }
+foreach ($m in ('Download copied link', { Show-Dialog }), ('Downloads', { Show-Downloads }), ('Settings', { Show-Settings }), ('Open download folder', { Open-Dir $C.SaveDir }), ('Exit', { Quit-App })) {
     [void]$Tray.ContextMenuStrip.Items.Add($m[0], $null, $m[1])
 }
 $Tray.Add_BalloonTipClicked({ Show-Downloads })
 $Tray.Add_MouseDoubleClick({ Show-Downloads })
 
-# Every half second: finish setup, update progress of running downloads
+# Every half second: close if a newer copy started, finish setup, update running downloads
 $Tick = New-Object Windows.Forms.Timer -Property @{ Interval = 500 }
 $Tick.Add_Tick({
+    if ($QuitEvent.WaitOne(0)) { Log 'A newer copy of MediaGrab started'; Quit-App; return }
+    Flush-Errors
     if ($S.Setup -and $S.Setup.State -notin 'Running', 'NotStarted') {
         $why = $S.Setup.ChildJobs[0].JobStateInfo.Reason.Message
-        if (-not (Test-Tools)) { Notify 'Setup failed' "Could not download yt-dlp / ffmpeg$(if ($why) { " ($why)" }). Check your internet, then press $($C.Hotkey) to try again." }
-        elseif ($S.FirstRun) { Notify 'MediaGrab is ready' "Press $($C.Hotkey) on a YouTube or Spotify tab." }
+        $ok = Test-Tools
+        Log "Setup finished after $([int]((Get-Date) - $S.SetupStart).TotalSeconds) s: $(if ($ok) { 'ready' } else { "failed ($why)" })"
+        if (-not $ok) {
+            $S.SetupError = $(if ($why) { $why } else { 'unknown error' })
+            if (-not $F.Visible) { Notify 'Setup failed' "Could not download yt-dlp / ffmpeg ($($S.SetupError)). MediaGrab tries again when you press $($C.Hotkey)." }
+        }
+        elseif ($S.FirstRun -and -not $F.Visible) { Notify 'MediaGrab is ready' "Press $($C.Hotkey) on a YouTube or Spotify tab." }
         Remove-Job $S.Setup -Force; $S.Setup = $null
     }
     foreach ($e in @($S.Active)) {
@@ -923,12 +1030,13 @@ $Tick.Add_Tick({
         }
         if ($e.Line.IsCompleted -and $e.Err.IsCompleted -and $e.P.HasExited) {
             $S.Active.Remove($e)
-            if ($e.P.ExitCode -eq 0) { Set-Status $e 'Done'; Save-History; Notify 'Download ready' $e.Name }
+            if ($e.P.ExitCode -eq 0) { Set-Status $e 'Done'; Save-History; Notify 'Download ready' $e.Name; Log "Download finished: $($e.Name)" }
             else {
                 $e.Error = Get-YtError $e.Err
                 if (-not $e.Error) { $e.Error = "yt-dlp stopped with error code $($e.P.ExitCode)." }
                 Set-Status $e "Failed: $($e.Error)"
                 Notify 'Download failed' "$($e.Name)`n$($e.Error)"
+                Log "Download failed: $($e.Name): $($e.Error)"
             }
         }
     }
@@ -937,62 +1045,67 @@ $Tick.Start()
 
 # ============================ Shortcut ============================
 $hk = New-Object Hotkey
-$hk.add_Pressed({
-    if ($F.Visible) { $F.Activate(); return }
-    if ($S.Setup) {   # wait for setup / the yt-dlp update check, so yt-dlp is not replaced mid-download
-        Notify 'One moment' $(if ($S.FirstRun) { 'Downloading yt-dlp and ffmpeg, please wait a minute.' } else { 'Checking yt-dlp for updates. Try again in a few seconds.' })
-        return
-    }
-    if (-not (Test-Tools)) { Start-Setup; Notify 'Setting up MediaGrab' 'Downloading yt-dlp and ffmpeg (about a minute)...'; return }
-    Show-Dialog
-})
-
-if ($S.FirstRun) { Notify 'Setting up MediaGrab' 'Downloading yt-dlp and ffmpeg (one time, about a minute)...' }
-else { Notify 'MediaGrab is running' "Press $($C.Hotkey) on a YouTube or Spotify tab." }
+$hk.add_Pressed({ Log 'Shortcut pressed'; Show-Dialog })
 $HotkeyOk = Set-Hotkey $C.Hotkey
+Log "Shortcut $($C.Hotkey): $(if ($HotkeyOk) { 'active' } else { 'could not be turned on (used by another program?)' })"
+if ($S.FirstRun) { Notify 'Setting up MediaGrab' 'Downloading yt-dlp and ffmpeg (one time, about a minute)...' }
+elseif ($HotkeyOk) { Notify 'MediaGrab is running' "Press $($C.Hotkey) on a YouTube or Spotify tab." }
 
 # ===================== Self-test (used only by the automatic build check on GitHub) =====================
-function Save-Shot($form, $name) {
-    if (-not $env:MEDIAGRAB_SELFTEST) { return }
-    $form.Show(); $form.Activate()
-    foreach ($i in 1..15) { [Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 40 }
-    $shot = New-Object Drawing.Bitmap $form.Width, $form.Height
-    $gr = [Drawing.Graphics]::FromImage($shot); $gr.CopyFromScreen($form.Location, [Drawing.Point]::Empty, $form.Size); $gr.Dispose()
-    $shot.Save("$env:MEDIAGRAB_SELFTEST\$name.png"); $shot.Dispose()
-    Test-Layout $form $name
-}
-# Finds text or boxes that overlap, stick out of the window, or are cut off
-function Test-Layout($form, $name) {
-    $what = { param($c) "$($c.GetType().Name) '$($c.Text)'" }
-    $cs = @($form.Controls | Where-Object { $_.Visible -and $_.Height -gt 1 })
-    $bad = [Collections.ArrayList]@()
-    for ($i = 0; $i -lt $cs.Count; $i++) {
-        $a = $cs[$i]
-        for ($j = $i + 1; $j -lt $cs.Count; $j++) { if ($a.Bounds.IntersectsWith($cs[$j].Bounds)) { [void]$bad.Add("$(& $what $a) overlaps $(& $what $cs[$j])") } }
-        if (-not $form.AutoScroll -and ($a.Right -gt $form.ClientSize.Width -or $a.Bottom -gt $form.ClientSize.Height)) { [void]$bad.Add("$(& $what $a) sticks out of the window") }
-        if ($a -is [Windows.Forms.Label] -and -not $a.AutoEllipsis -and $a.PreferredWidth -gt $a.Width + 1) { [void]$bad.Add("$(& $what $a) is cut off") }
-        if ($a -is [MgButton] -and (TextW $a.Text $a.Font) -gt $a.Width - (Px 8)) { [void]$bad.Add("$(& $what $a) text does not fit") }
-    }
-    Check ($bad.Count -eq 0) "Layout of '$name' window (scale $([math]::Round($Z, 2)))$(if ($bad.Count) { ': ' + ($bad -join '; ') })"
-}
-function Wait-Until([scriptblock]$done, $seconds) {
-    $end = (Get-Date).AddSeconds($seconds)
-    while (-not (& $done) -and (Get-Date) -lt $end) { [Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 100 }
-    [bool](& $done)
-}
-function Start-Fake($url, $name) {   # starts a download the same way the Download button does
-    $S.Kind = 'youtube'; $S.Url = $S.Target = $url; $S.Name = $name; $S.Started = $null
-    foreach ($b in $U.Start, $U.End, $U.Name) { $b.Text = '' }
-    $U.Type.Value = 'mp3'
-    Start-Download
-    @(Get-Entries)[0]
-}
 if ($env:MEDIAGRAB_SELFTEST) {
+    $Out = $env:MEDIAGRAB_SELFTEST
     $Log = [Collections.ArrayList]@(); $Fails = 0
     function Check($ok, $what) { [void]$Log.Add("$(if ($ok) { 'PASS' } else { 'FAIL' })  $what"); if (-not $ok) { $script:Fails++ } }
-    $C.SaveDir = "$env:MEDIAGRAB_SELFTEST\downloads"
-    Check $HotkeyOk "Keyboard shortcut $($C.Hotkey) registered"
-    Check ((Set-Hotkey 'Ctrl+Shift+1') -and -not (Set-Hotkey 'Shift+K') -and (Set-Hotkey $C.Hotkey)) 'Shortcuts with numbers work; ones without Ctrl, Alt or Win are refused'
+    function Note($ok, $what) { [void]$Log.Add("$(if ($ok) { 'PASS' } else { 'WARN' })  $what") }   # depends on YouTube / Spotify, so only a warning
+    function Wait-Until([scriptblock]$done, $seconds) {
+        $end = (Get-Date).AddSeconds($seconds)
+        while (-not (& $done) -and (Get-Date) -lt $end) { [Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 50 }
+        [bool](& $done)
+    }
+    function Save-Shot($form, $name) {
+        if (-not $form.Visible) { $form.Show() }
+        $form.Activate()
+        foreach ($i in 1..10) { [Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 40 }
+        $shot = New-Object Drawing.Bitmap $form.Width, $form.Height
+        $gr = [Drawing.Graphics]::FromImage($shot); $gr.CopyFromScreen($form.Location, [Drawing.Point]::Empty, $form.Size); $gr.Dispose()
+        $shot.Save("$Out\$name.png"); $shot.Dispose()
+        Test-Layout $form $name
+    }
+    # Finds text or boxes that overlap, stick out of their area, or are cut off
+    function Test-Layout($form, $name) {
+        $bad = [Collections.ArrayList]@()
+        $what = { param($c) "$($c.GetType().Name) '$($c.Text)' at $($c.Left),$($c.Top) size $($c.Width)x$($c.Height)" }
+        $walk = {
+            param($box)
+            $cs = @($box.Controls | Where-Object { $_.Visible -and $_.Height -gt 1 -and $_.Width -gt 1 })
+            for ($i = 0; $i -lt $cs.Count; $i++) {
+                $a = $cs[$i]
+                for ($j = $i + 1; $j -lt $cs.Count; $j++) { if ($a.Bounds.IntersectsWith($cs[$j].Bounds)) { [void]$bad.Add("$(& $what $a) overlaps $(& $what $cs[$j])") } }
+                if (-not $box.AutoScroll -and ($a.Left -lt 0 -or $a.Top -lt 0 -or $a.Right -gt $box.ClientSize.Width -or $a.Bottom -gt $box.ClientSize.Height)) { [void]$bad.Add("$(& $what $a) sticks out of its area") }
+                if ($a -is [Windows.Forms.Label] -and -not $a.AutoEllipsis -and $a.PreferredWidth -gt $a.Width + 1) { [void]$bad.Add("$(& $what $a) is cut off") }
+                if ($a -is [MgButton] -and (TextW $a.Text $a.Font) -gt $a.Width - (Px 8)) { [void]$bad.Add("$(& $what $a) text does not fit") }
+                if ($a.GetType() -eq [Windows.Forms.Panel]) { & $walk $a }
+            }
+        }
+        & $walk $form
+        Check ($bad.Count -eq 0) "Layout of the '$name' window (scale $([math]::Round($Z, 2)))$(if ($bad.Count) { ': ' + ($bad -join '; ') })"
+    }
+    function Start-Fake($url, $name) {   # starts a download the same way the Download button does
+        $S.Kind = 'youtube'; $S.Url = $S.Target = $url; $S.Name = $name; $S.Started = $null
+        foreach ($b in $U.Start, $U.End, $U.Name) { $b.Text = '' }
+        $U.Type.Value = 'mp3'
+        Start-Download
+        @(Get-Entries)[0]
+    }
+    function Press($keys) { [Hotkey]::Tap([byte[]]$keys) }
+    $CtrlAltY = 0x11, 0x12, 0x59; $CtrlAltK = 0x11, 0x12, 0x4B
+    $YouTubeLink = 'https://www.youtube.com/watch?v=jNQXAC9IVRw'
+    $SpotifyLink = 'https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT'
+    function Copy-Text($text) { [Windows.Forms.Clipboard]::SetText($text) }
+
+    $C.SaveDir = "$Out\downloads"
+    Check $HotkeyOk "Keyboard shortcut $($C.Hotkey) turned on at start"
+    Check ((Set-Hotkey 'Ctrl+Shift+1') -and -not (Set-Hotkey 'Shift+K') -and -not (Set-Hotkey 'K') -and (Set-Hotkey $C.Hotkey)) 'Shortcuts with numbers work; ones without Ctrl, Alt or Win are refused'
     Check (Wait-Until { -not $S.Setup } 600) 'Setup finished within 10 minutes'
     Check (Test-Tools) 'yt-dlp, ffmpeg and ffprobe are installed'
     $r = Start-YtDlp '--version'; $r.P.WaitForExit()
@@ -1001,30 +1114,108 @@ if ($env:MEDIAGRAB_SELFTEST) {
     $bad = Start-Fake 'https://www.youtube.com/watch?v=0000000000x' 'Selftest broken link'
     Check (Wait-Until { $bad.Status -like 'Failed*' } 120) "A broken link fails with a reason: $($bad.Status)"
     Check ([bool]$bad.Error) 'The failure reason was captured'
-    $good = Start-Fake 'https://www.youtube.com/watch?v=jNQXAC9IVRw' 'Selftest'
+    $good = Start-Fake $YouTubeLink 'Selftest'
     [void](Wait-Until { $good.Status -eq 'Done' -or $good.Status -like 'Failed*' } 300)
-    # YouTube often blocks GitHub's servers, so a failure here is only a warning
-    [void]$Log.Add("$(if ($good.Status -eq 'Done') { 'PASS' } else { 'WARN' })  Real download (mp3): $($good.Status)")
+    Note ($good.Status -eq 'Done') "Real download (mp3): $($good.Status)"
     if ($good.Status -eq 'Done') { Check (Test-Path "$($C.SaveDir)\Selftest.mp3") 'The mp3 file was saved' }
 
-    # Screenshots of every window, with sample content
+    # Screenshots with sample content
     $demo = @{ Name = 'Example Artist - Example Song.mp3'; Dir = $C.SaveDir; Date = Get-Date -Format 'yyyy-MM-dd HH:mm'; Status = 'Starting...' }
     Add-Entry $demo; Set-Status $demo "42.5%$($Dot)3.10MiB/s$($Dot)00:12 left" '42.5'
-    Save-Shot $D 'downloads'; $D.Hide()
+    Save-Shot $D 'downloads'
     $U.Title.Text = 'Example Artist - Example Song (Official Video)'; $U.Info.Text = "YouTube$($Dot)3:45"; $U.Url.Text = 'https://www.youtube.com/watch?v=example'
-    $U.Type.Value = 'mp3'; $U.VQ.Value = 'Best'; $U.Go.Fill = $T.YouTube; $U.Go.Hover = $T.YouTubeHover; $U.Go.Enabled = $true; $U.Match.Visible = $false; $U.Url.Visible = $true
-    Set-Hints; Save-Shot $F 'download-youtube'
-    $U.Type.Value = 'mp4'; Save-Shot $F 'download-video'; $F.Hide()
-    Show-Settings -Shot
+    $U.Type.Value = 'mp4'; $U.VQ.Value = 'Best'; $U.Go.Fill = $T.YouTube; $U.Go.Hover = $T.YouTubeHover; $U.Go.Enabled = $true; $U.Match.Visible = $false; $U.Url.Visible = $true
+    Set-Hints; Save-Shot $F 'download-sample'; $F.Hide()
 
-    $errs = @($Error)
-    foreach ($e in $errs) { [void]$Log.Add("ERROR  $e  [line $($e.InvocationInfo.ScriptLineNumber)]") }
-    Check ($errs.Count -eq 0) "No script errors ($($errs.Count) found)"
-    $Log | Set-Content "$env:MEDIAGRAB_SELFTEST\result.txt"
+    # Then use MediaGrab like a person: press the shortcut, change it in Settings, press the new one.
+    # Each step runs on a timer, so it also runs while a window is open and waiting.
+    $Steps = [Collections.ArrayList]@(); $StepAt = 0; $StepStart = Get-Date; $Running = @{}
+    function Add-Step($name, $seconds, $do) { [void]$Steps.Add(@{ Name = $name; Seconds = $seconds; Do = $do }) }
+    $StepTimer = New-Object Windows.Forms.Timer -Property @{ Interval = 150 }
+    $StepTimer.Add_Tick({
+        $i = $script:StepAt
+        if ($i -ge $Steps.Count) { $StepTimer.Stop(); return }
+        if ($Running[$i]) { return }   # this step is still busy (e.g. taking a screenshot)
+        $Running[$i] = $true
+        $st = $Steps[$i]
+        try { $done = [bool](& $st.Do) } catch { Check $false "$($st.Name): $_"; $done = $true }
+        $Running.Remove($i)
+        if (-not $done -and ((Get-Date) - $script:StepStart).TotalSeconds -gt $st.Seconds) {
+            Check $false "$($st.Name): did not happen within $($st.Seconds) s (window title: '$($U.Title.Text)', info: '$($U.Info.Text)')"
+            $done = $true
+            if ($script:SettingsUi) { $script:SettingsUi.W.Close() } elseif ($F.Visible) { $F.DialogResult = 'Cancel' }
+        }
+        if ($done -and $script:StepAt -eq $i) { $script:StepAt++; $script:StepStart = Get-Date }
+    })
+    function Wait-Idle { -not $Load.Enabled -and -not $Poll.Enabled }
+
+    Add-Step 'Press Ctrl+Alt+Y with a YouTube link copied' 5 { Copy-Text $YouTubeLink; Show-Downloads; $script:Pressed = Get-Date; Press $CtrlAltY; $true }
+    Add-Step 'The download window opens at once' 5 {
+        if (-not $F.Visible) { return $false }
+        $ms = [int]((Get-Date) - $script:Pressed).TotalMilliseconds
+        Check ($ms -lt 2000) "Pressing the shortcut opened the download window after $ms ms (shows '$($U.Title.Text)')"; $true }
+    Add-Step 'The YouTube link is looked up' 90 {
+        if (-not (Wait-Idle)) { return $false }
+        Check ($S.Url -eq $YouTubeLink) "The copied YouTube link was used: $($S.Url)"
+        Note ($U.Title.Text -notin 'Not available', 'Loading...') "YouTube details: '$($U.Title.Text)' / '$($U.Info.Text)'"
+        Save-Shot $F 'download-youtube'; $F.DialogResult = 'Cancel'; $true }
+    Add-Step 'The window closes' 5 { -not $F.Visible }
+    Add-Step 'Press Ctrl+Alt+Y with a Spotify link copied' 5 { Copy-Text $SpotifyLink; Show-Downloads; Press $CtrlAltY; $true }
+    Add-Step 'The Spotify song is looked up' 90 {
+        if (-not $F.Visible -or -not (Wait-Idle)) { return $false }
+        Check ($S.Kind -eq 'spotify') "The copied Spotify link was used: $($S.Url)"
+        Note ([bool]$S.SpTitle) "Spotify details: '$($U.Title.Text)' / '$($U.Info.Text)'"
+        Save-Shot $F 'download-spotify'; $F.DialogResult = 'Cancel'; $true }
+    Add-Step 'The window closes' 5 { -not $F.Visible }
+    Add-Step 'Press Ctrl+Alt+Y with nothing useful copied' 5 { Copy-Text 'hello'; Show-Downloads; Press $CtrlAltY; $true }
+    Add-Step 'The window explains what to do' 30 {
+        if (-not $F.Visible -or -not (Wait-Idle)) { return $false }
+        Check ($U.Title.Text -eq 'No video or song found') "With no link, the window says: '$($U.Title.Text)' / '$($U.Info.Text) $($U.Url.Text)'"
+        Save-Shot $F 'download-no-link'; $F.DialogResult = 'Cancel'; $true }
+    Add-Step 'The window closes' 5 { -not $F.Visible }
+    Add-Step 'Open Settings' 5 { $script:StepAt++; $script:StepStart = Get-Date; Show-Settings; $true }   # stays open until a later step saves
+    Add-Step 'Settings shows the current shortcut' 10 {
+        if (-not $script:SettingsUi -or -not $script:SettingsUi.W.Visible) { return $false }
+        Check ($script:SettingsUi.Key.Box.Text -eq 'Ctrl+Alt+Y') "Settings shows the shortcut '$($script:SettingsUi.Key.Box.Text)'"
+        Save-Shot $script:SettingsUi.W 'settings'; $true }
+    Add-Step 'Click the shortcut box and press Ctrl+Alt+K' 5 { $script:SettingsUi.W.Activate(); [void]$script:SettingsUi.Key.Box.Focus(); Press $CtrlAltK; $true }
+    Add-Step 'The box shows Ctrl+Alt+K, then Save' 5 {
+        if ($script:SettingsUi.Key.Value -ne 'Ctrl+Alt+K') { return $false }
+        Check $true "The shortcut box shows '$($script:SettingsUi.Key.Box.Text)'"
+        Save-Shot $script:SettingsUi.W 'settings-new-shortcut'; $script:SettingsUi.Save.PerformClick(); $true }
+    Add-Step 'Settings closes and keeps the new shortcut' 5 {
+        if ($script:SettingsUi) { return $false }
+        Check ($C.Hotkey -eq 'Ctrl+Alt+K') "Saved shortcut: $($C.Hotkey)"
+        Check ((Get-Content $CfgFile -Raw) -match 'Ctrl\+Alt\+K') 'The new shortcut is in the settings file'; $true }
+    Add-Step 'Press the new shortcut Ctrl+Alt+K' 5 { Copy-Text $YouTubeLink; Show-Downloads; Press $CtrlAltK; $true }
+    Add-Step 'The new shortcut opens the window' 5 { if (-not $F.Visible) { return $false }; Check $true 'Ctrl+Alt+K opens the download window'; $F.DialogResult = 'Cancel'; $true }
+    Add-Step 'The window closes' 5 { -not $F.Visible }
+    Add-Step 'Press the old shortcut Ctrl+Alt+Y' 5 { Show-Downloads; $script:Pressed = Get-Date; Press $CtrlAltY; $true }
+    Add-Step 'The old shortcut does nothing now' 5 {
+        if ($F.Visible) { Check $false 'The old shortcut Ctrl+Alt+Y still opens the window'; $F.DialogResult = 'Cancel'; return $true }
+        if (((Get-Date) - $script:Pressed).TotalSeconds -lt 2) { return $false }
+        Check $true 'The old shortcut Ctrl+Alt+Y no longer opens the window'; $true }
+    Add-Step 'Change back to Ctrl+Alt+Y' 5 { $C.Hotkey = 'Ctrl+Alt+Y'; Save-Config; Check (Set-Hotkey $C.Hotkey) 'Shortcut changed back to Ctrl+Alt+Y'; $true }
+
+    $StepTimer.Start()
+    Check (Wait-Until { $script:StepAt -ge $Steps.Count } 600) "All $($Steps.Count) steps ran"
+    $StepTimer.Stop(); $D.Hide()
+
+    Flush-Errors
+    foreach ($e in $ErrorLog) { [void]$Log.Add("ERROR  $e") }
+    Check ($ErrorLog.Count -eq 0) "No script errors ($($ErrorLog.Count) found)"
+    Copy-Item $LogFile "$Out\log.txt" -ErrorAction Ignore
+    $Log | Set-Content "$Out\result.txt"
     $Log | ForEach-Object { [Console]::WriteLine($_) }
     $Tray.Visible = $false
     [Environment]::Exit([int]($Fails -gt 0))
 }
 
-if (-not $HotkeyOk) { [void][Windows.Forms.MessageBox]::Show("Shortcut $($C.Hotkey) is unavailable. Please choose another one.", 'MediaGrab'); Show-Settings }
+if (-not $HotkeyOk) {
+    Show-Message "The keyboard shortcut $($C.Hotkey) is already used by another program.`n`nIn the Settings window that opens next, click the shortcut box and press a different one."
+    Show-Settings
+}
 [Windows.Forms.Application]::Run()
+Log 'Closed'
+try { $Mutex.ReleaseMutex() } catch { }
+[Environment]::Exit(0)
