@@ -385,8 +385,8 @@ $Fonts = @{
 $CtlH = [math]::Max((Px 36), $Fonts.Base.Height + (Px 14))   # height of boxes, buttons and switches
 
 # ============================ Helpers =============================
-function Get-TabUrl {
-    $win = $UIA::FromHandle([Hotkey]::GetForegroundWindow())
+function Get-TabUrl($hwnd) {
+    $win = $UIA::FromHandle($hwnd)
     if ((Get-Process -Id $win.Current.ProcessId).Name -notin ($C.Browsers -split '\s*,\s*')) { return }
     $edit = $win.FindFirst('Descendants', (New-Object Windows.Automation.PropertyCondition($UIA::ControlTypeProperty, [Windows.Automation.ControlType]::Edit)))
     $url  = $edit.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value
@@ -696,6 +696,17 @@ $U.Go.Add_Click({ Start-Download })
 # Fills in details once yt-dlp answers (for Spotify: lists YouTube results, picks the one closest in length)
 $Poll = New-Object Windows.Forms.Timer -Property @{ Interval = 250 }
 $Poll.Add_Tick({
+    if ($S.Page) {   # Spotify: page downloaded in the background
+        if (-not $S.Page.IsCompleted) { return }
+        $task = $S.Page; $S.Page = $null
+        Read-SpotifyPage $(if ($task.Status -eq 'RanToCompletion') { $task.Result })
+        if (-not $S.SpTitle) { $Poll.Stop(); Show-Problem 'Could not read this Spotify song' 'Check your internet connection and try again.'; return }
+        $S.Name = $U.Title.Text = $(if ($S.SpArtist) { "$($S.SpArtist) - $($S.SpTitle)" } else { $S.SpTitle })
+        $U.Info.Text = 'Finding the song on YouTube...'
+        $q = $S.Name -replace '"'
+        Start-Lookup "--flat-playlist -i --playlist-items 1:5 $Fields `"https://music.youtube.com/search?q=$([Uri]::EscapeDataString($q))#songs`" `"ytsearch5:$q`""
+        return
+    }
     if (-not ($S.Meta.IsCompleted -and $S.MetaErr.IsCompleted)) { return }
     $Poll.Stop()
     $seen = @{}
@@ -714,6 +725,7 @@ $Poll.Add_Tick({
     if (-not $best) { $best = $S.Found | Sort-Object Diff | Select-Object -First 1 }
     if ($S.Kind -eq 'spotify') {
         $U.Info.Text = "Spotify length $(Format-Len $S.SpDur)$($Dot)YouTube match (change if wrong):"
+        $U.Url.Visible = $false; $U.Match.Visible = $true
         $U.Match.Items.Clear()
         foreach ($m in $S.Found) { [void]$U.Match.Items.Add("$($m.Title)  ($(Format-Len $m.Dur))") }
         $U.Match.SelectedIndex = @(0..($S.Found.Count - 1) | Where-Object { $S.Found[$_].Id -eq $best.Id })[0]
@@ -728,46 +740,73 @@ $Poll.Add_Tick({
 
 function Get-Meta($html, $name) { [Net.WebUtility]::HtmlDecode([regex]::Match($html, "$name`" content=`"([^`"]*)").Groups[1].Value) }
 
-function Show-Dialog($url, $kind) {
-    foreach ($k in 'Name', 'Len', 'SpDur', 'SpTitle', 'SpArtist', 'SpAlbum', 'Started') { $S[$k] = $null }
+$Fields = '--print "%(id)s|%(duration)s|%(title)s"'
+
+# Shows what went wrong in the open window
+function Show-Problem($title, $text, $hint = '') {
+    $Poll.Stop()
+    $U.Title.Text = $title; $U.Info.Text = $text; $U.Info.ForeColor = $T.Bad
+    $U.Url.Text = $hint; $U.Url.Visible = $true; $U.Match.Visible = $false; $U.Go.Enabled = $false
+}
+# Asks yt-dlp for the id, length and title (in the background)
+function Start-Lookup($query) {
+    try { $run = Start-YtDlp $query }
+    catch { Show-Problem 'yt-dlp could not start' $_.Exception.Message; return }
+    $S.Meta = $run.P.StandardOutput.ReadToEndAsync(); $S.MetaErr = $run.Err
+    $Poll.Start()
+}
+# Reads title, artist, album, length and cover from a Spotify song page
+function Read-SpotifyPage($html) {
+    if (-not $html) { return }
+    $page = [Net.WebUtility]::HtmlDecode([regex]::Match($html, '<title>(.*?)</title>').Groups[1].Value)
+    if ($page -match '^(.+) - song(?: and lyrics)? by (.+?) \| Spotify') { $S.SpTitle, $S.SpArtist = $Matches[1], $Matches[2] }
+    else { $S.SpTitle = Get-Meta $html 'og:title' }
+    $desc = (Get-Meta $html 'og:description') -split " $([char]0xB7) "
+    if ($desc.Count -ge 4 -and $desc[0] -notlike 'Listen to*') { if (-not $S.SpArtist) { $S.SpArtist = $desc[0] }; $S.SpAlbum = $desc[1] }
+    $S.SpDur = [regex]::Match($html, 'music:duration" content="(\d+)').Groups[1].Value -as [double]
+    $img = Get-Meta $html 'og:image'
+    if ($img) { $U.Pic.LoadUrl($img) }
+}
+
+# Runs right after the window has appeared: finds the link, then starts looking it up
+$Load = New-Object Windows.Forms.Timer -Property @{ Interval = 30 }
+$Load.Add_Tick({
+    $Load.Stop(); $F.Refresh()
+    $url = $null; try { $url = Get-TabUrl $S.Fg } catch { }
+    if (-not (Get-Kind $url)) { try { $url = "$([Windows.Forms.Clipboard]::GetText())".Trim() } catch { } }   # no matching tab: try a copied link
+    $kind = Get-Kind $url
+    if (-not $kind) { Show-Problem 'No video or song found' 'Open a YouTube video or Spotify song, or copy its link,' "then press $($C.Hotkey) again."; return }
     $S.Url = $S.Target = $url; $S.Kind = $kind
+    $U.Url.Text = $url; $U.Pic.Crop = $kind -eq 'youtube'
+    $U.Go.Fill  = if ($kind -eq 'spotify') { $T.Spotify } else { $T.YouTube }
+    $U.Go.Hover = if ($kind -eq 'spotify') { $T.SpotifyHover } else { $T.YouTubeHover }
+    if ($kind -eq 'spotify') {
+        $U.Info.Text = 'Reading the song from Spotify...'
+        $wc = New-Object Net.WebClient; $wc.Encoding = [Text.Encoding]::UTF8
+        $wc.Headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+        $S.Page = $wc.DownloadStringTaskAsync($url)
+        $Poll.Start()
+    } else {
+        $U.Info.Text = 'Looking up the video...'
+        $U.Go.Enabled = $true
+        Start-Lookup "--no-playlist $Fields `"$url`""
+    }
+})
+
+# Opens the download window at once, so it is clear the shortcut worked
+function Show-Dialog {
+    $S.Fg = [Hotkey]::GetForegroundWindow()   # the browser, before our window takes its place
+    foreach ($k in 'Url', 'Target', 'Kind', 'Name', 'Len', 'SpDur', 'SpTitle', 'SpArtist', 'SpAlbum', 'Started', 'Meta', 'MetaErr', 'Page', 'Found') { $S[$k] = $null }
     foreach ($b in $U.Start, $U.End, $U.Name) { $b.Text = '' }
     $U.Type.Value = $C.Format
     $U.VQ.Value = $C.VideoQuality
-    $U.Pic.ClearImage(); $U.Pic.Crop = $kind -eq 'youtube'
-    $U.Url.Text = $url; $U.Title.Text = 'Loading...'; $U.Info.Text = ''; $U.Info.ForeColor = $T.Sub
-    $U.Match.Items.Clear(); $U.Match.Visible = $kind -eq 'spotify'
-    $U.Url.Visible = $kind -ne 'spotify'
-    $U.Go.Fill  = if ($kind -eq 'spotify') { $T.Spotify } else { $T.YouTube }
-    $U.Go.Hover = if ($kind -eq 'spotify') { $T.SpotifyHover } else { $T.YouTubeHover }
-    $U.Go.Enabled = $kind -eq 'youtube'   # Spotify waits until a YouTube match is found
-    $fields = '--print "%(id)s|%(duration)s|%(title)s"'
-    $query  = "--no-playlist $fields `"$url`""
-
-    if ($kind -eq 'spotify') {
-        try {
-            $html = (Invoke-WebRequest $url -UseBasicParsing -TimeoutSec 8).Content
-            $page = [Net.WebUtility]::HtmlDecode([regex]::Match($html, '<title>(.*?)</title>').Groups[1].Value)
-            if ($page -match '^(.+) - song(?: and lyrics)? by (.+?) \| Spotify') { $S.SpTitle, $S.SpArtist = $Matches[1], $Matches[2] }
-            else { $S.SpTitle = Get-Meta $html 'og:title' }
-            $desc = (Get-Meta $html 'og:description') -split " $([char]0xB7) "
-            if ($desc.Count -ge 4 -and $desc[0] -notlike 'Listen to*') { if (-not $S.SpArtist) { $S.SpArtist = $desc[0] }; $S.SpAlbum = $desc[1] }
-            $S.SpDur = [regex]::Match($html, 'music:duration" content="(\d+)').Groups[1].Value -as [double]
-            $img = Get-Meta $html 'og:image'
-            if ($img) { $U.Pic.LoadUrl($img) }
-        } catch { }
-        if (-not $S.SpTitle) { Notify 'MediaGrab' 'Could not read this Spotify page.'; return }
-        $S.Name = $U.Title.Text = $(if ($S.SpArtist) { "$($S.SpArtist) - $($S.SpTitle)" } else { $S.SpTitle })
-        $q = $S.Name -replace '"'
-        $query = "--flat-playlist -i --playlist-items 1:5 $fields `"https://music.youtube.com/search?q=$([Uri]::EscapeDataString($q))#songs`" `"ytsearch5:$q`""
-    }
-
-    try { $run = Start-YtDlp $query }
-    catch { Notify 'MediaGrab' "yt-dlp could not start: $($_.Exception.Message)"; return }
-    $S.Meta = $run.P.StandardOutput.ReadToEndAsync(); $S.MetaErr = $run.Err
-    $Poll.Start()
+    $U.Pic.ClearImage()
+    $U.Title.Text = 'Loading...'; $U.Info.Text = 'Reading the link from your browser...'; $U.Info.ForeColor = $T.Sub
+    $U.Url.Text = ''; $U.Url.Visible = $true; $U.Match.Items.Clear(); $U.Match.Visible = $false
+    $U.Go.Fill = $T.Primary; $U.Go.Hover = $T.PrimaryHover; $U.Go.Enabled = $false
+    $Load.Start()
     [void]$F.ShowDialog()
-    $Poll.Stop()
+    $Load.Stop(); $Poll.Stop()
     if ($S.Started) { Show-Downloads }
 }
 
@@ -792,9 +831,7 @@ function Show-Settings([switch]$Shot) {
         if ($Choices[$k]) { $box[$k] = Add-Segments $W $Choices[$k] $X0 $y $CW; $box[$k].Value = $C[$k] }
         elseif ($k -eq 'Hotkey') {
             $kf = Add-Ctl $W MgKeyField @{ Location = New-Object Drawing.Point($X0, $y); Size = New-Object Drawing.Size($CW, $CtlH); Border = $T.Border; FocusColor = $T.Focus; Fill = $T.Field }
-            $kf.Box.ForeColor = $T.Text; $kf.Box.Font = $Fonts.Base; $kf.Value = $C.Hotkey
-            # pause the current shortcut while a new one is pressed, so it does not open the download window
-            $kf.Box.Add_GotFocus({ $hk.Unregister() }); $kf.Box.Add_LostFocus({ [void](Set-Hotkey $C.Hotkey) })
+            $kf.Box.ForeColor = $T.Text; $kf.Box.Font = $Fonts.Base; $kf.Value = $(if ($C.Hotkey) { $C.Hotkey } else { 'Ctrl+Alt+Y' })
             $box[$k] = $kf
         }
         elseif ($k -eq 'SaveDir') {
@@ -813,6 +850,7 @@ function Show-Settings([switch]$Shot) {
     $W.CancelButton = Add-Button $W 'Cancel' ($SW - $M - $cancelW) $y $cancelW
     $W.CancelButton.DialogResult = 'Cancel'
     $W.AcceptButton = $save
+    $W.ActiveControl = $save   # don't start inside the shortcut box
     [void](Add-RowLabel $W "MediaGrab $Version" $M $y @{ ForeColor = $T.Faint })
     $W.ClientSize = New-Object Drawing.Size($SW, ($y + $CtlH + $M))
     Fit-Screen $W
@@ -823,14 +861,23 @@ function Show-Settings([switch]$Shot) {
                elseif ($new.MatchTolerance -notmatch '^\d+(\.\d+)?$') { 'Match tolerance must be a number.' }
                elseif (-not ((Test-Time $new.StartTime) -and (Test-Time $new.EndTime))) { 'Times must look like 90 or 1:30.' }
                elseif (-not $new.SaveDir) { 'Choose a download folder.' }
-               elseif (-not (Set-Hotkey $new.Hotkey)) { [void](Set-Hotkey $C.Hotkey); "The shortcut $($new.Hotkey) is already used by Windows or another program. Click the shortcut box and press a different one." }
+               elseif (-not (Set-Hotkey $new.Hotkey)) { $hk.Unregister(); "The shortcut $($new.Hotkey) is already used by Windows or another program. Click the shortcut box and press a different one." }
         if ($err) { [void][Windows.Forms.MessageBox]::Show($W, $err, 'MediaGrab'); return }
         foreach ($k in $new.Keys) { $C[$k] = $new[$k] }
         Save-Config
         if ($auto.Checked) { Set-ItemProperty $RunKey MediaGrab "`"$ExePath`"" } else { Remove-ItemProperty $RunKey MediaGrab -ErrorAction Ignore }
         $W.Close()
     })
-    if ($Shot) { Save-Shot $W 'settings'; $W.Close() } else { [void]$W.ShowDialog() }
+    $hk.Unregister()   # the shortcut is paused while Settings is open, so it can be pressed in the shortcut box
+    if ($Shot) {
+        Save-Shot $W 'settings'
+        $kf.Box.Focus(); [Windows.Forms.SendKeys]::SendWait('^%k')
+        foreach ($i in 1..10) { [Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 30 }
+        $typed = $kf.Value; $save.PerformClick()
+        Check ($typed -eq 'Ctrl+Alt+K' -and $C.Hotkey -eq 'Ctrl+Alt+K') "Pressing Ctrl+Alt+K in the shortcut box and saving works (box: $typed, saved: $($C.Hotkey))"
+        $C.Hotkey = 'Ctrl+Alt+Y'; Save-Config
+        if (-not $W.IsDisposed) { $W.Close() }
+    } else { [void]$W.ShowDialog() }
     $W.Dispose()
     [void](Set-Hotkey $C.Hotkey)   # make sure the shortcut is active again
 }
@@ -891,16 +938,13 @@ $Tick.Start()
 # ============================ Shortcut ============================
 $hk = New-Object Hotkey
 $hk.add_Pressed({
-    if ($F.Visible) { return }
+    if ($F.Visible) { $F.Activate(); return }
     if ($S.Setup) {   # wait for setup / the yt-dlp update check, so yt-dlp is not replaced mid-download
         Notify 'One moment' $(if ($S.FirstRun) { 'Downloading yt-dlp and ffmpeg, please wait a minute.' } else { 'Checking yt-dlp for updates. Try again in a few seconds.' })
         return
     }
     if (-not (Test-Tools)) { Start-Setup; Notify 'Setting up MediaGrab' 'Downloading yt-dlp and ffmpeg (about a minute)...'; return }
-    $url = $null; try { $url = Get-TabUrl } catch { }
-    if (-not (Get-Kind $url)) { $url = "$([Windows.Forms.Clipboard]::GetText())".Trim() }   # no matching tab: try a copied link
-    $kind = Get-Kind $url
-    if ($kind) { Show-Dialog $url $kind } else { Notify 'MediaGrab' 'Open a YouTube video or Spotify song, or copy its link, then press the shortcut.' }
+    Show-Dialog
 })
 
 if ($S.FirstRun) { Notify 'Setting up MediaGrab' 'Downloading yt-dlp and ffmpeg (one time, about a minute)...' }
