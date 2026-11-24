@@ -45,24 +45,26 @@ jobs:
         shell: bash
         run: ./build.sh
 
-      - name: Self-test, light mode (first start, downloads yt-dlp and ffmpeg)
+      - name: Self-test, light mode (started through MediaGrab.exe, like a person does; first start)
         shell: powershell
         run: |
           $env:MEDIAGRAB_THEME = 'light'
           $env:MEDIAGRAB_SELFTEST = "$PWD\selftest\light"
           New-Item $env:MEDIAGRAB_SELFTEST -ItemType Directory -Force | Out-Null
-          powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File src\MediaGrab.ps1
-          exit $LASTEXITCODE
+          $p = Start-Process .\MediaGrab.exe -PassThru; $null = $p.Handle; $p.WaitForExit()
+          Get-Content "$env:MEDIAGRAB_SELFTEST\result.txt" -ErrorAction SilentlyContinue
+          exit $p.ExitCode
 
-      - name: Self-test, dark mode at 150% size (later start, only checks for updates)
+      - name: Self-test, dark mode at 150% size (started with Windows' "start hidden"; later start)
         shell: powershell
         run: |
           $env:MEDIAGRAB_THEME = 'dark'
           $env:MEDIAGRAB_SCALE = '1.5'
           $env:MEDIAGRAB_SELFTEST = "$PWD\selftest\dark"
           New-Item $env:MEDIAGRAB_SELFTEST -ItemType Directory -Force | Out-Null
-          powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File src\MediaGrab.ps1
-          exit $LASTEXITCODE
+          $p = Start-Process powershell.exe '-NoProfile -STA -ExecutionPolicy Bypass -File src\MediaGrab.ps1' -WindowStyle Hidden -PassThru; $null = $p.Handle; $p.WaitForExit()
+          Get-Content "$env:MEDIAGRAB_SELFTEST\result.txt" -ErrorAction SilentlyContinue
+          exit $p.ExitCode
 
       - name: Keep the exe and screenshots
         if: always()

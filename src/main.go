@@ -1,4 +1,4 @@
-// MediaGrab launcher: unpacks the embedded script and runs it with Windows' built-in PowerShell, hidden.
+// MediaGrab launcher: unpacks the embedded script and runs it with Windows' built-in PowerShell.
 package main
 
 import (
@@ -20,7 +20,19 @@ func main() {
 		return
 	}
 	exe, _ := os.Executable()
-	cmd := exec.Command("powershell.exe", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", ps1, "-ExePath", exe)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
-	cmd.Start()
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File", ps1, "-ExePath", exe)
+	// No console window (CREATE_NO_WINDOW). Do not also ask for a hidden start: Windows would then
+	// hide the first window MediaGrab opens, and the download window would never appear.
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x08000000}
+	if cmd.Start() != nil {
+		return
+	}
+	if os.Getenv("MEDIAGRAB_SELFTEST") != "" { // the automatic build check waits for the test result
+		if err := cmd.Wait(); err != nil {
+			if exit, ok := err.(*exec.ExitError); ok {
+				os.Exit(exit.ExitCode())
+			}
+			os.Exit(1)
+		}
+	}
 }

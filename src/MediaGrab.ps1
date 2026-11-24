@@ -39,6 +39,8 @@ public class Hotkey : NativeWindow {
     [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr h, int id);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, string l);
     public static void Hint(TextBox box, string text) { SendMessage(box.Handle, 0x1501, (IntPtr)1, text); }
     public event EventHandler Pressed;
@@ -368,6 +370,10 @@ catch {   # could not use the saved copy: compile in memory this time
 }
 # Draw at the screen's real resolution (otherwise Windows stretches the windows and text looks blurry)
 [void][Hotkey]::SetProcessDPIAware()
+# When a program is started with "start hidden", Windows hides the first window it shows. Use that
+# up on an invisible placeholder, so the download window is never the one that gets hidden.
+$first = New-Object Windows.Forms.NativeWindow; $first.CreateHandle((New-Object Windows.Forms.CreateParams))
+[void][Hotkey]::ShowWindow($first.Handle, 0); $first.DestroyHandle()
 [Windows.Forms.Application]::EnableVisualStyles()
 [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
 
@@ -502,6 +508,7 @@ function New-Window($title, $w, $h, [switch]$Sizable) {
     $f.FormBorderStyle = if ($Sizable) { 'Sizable' } else { 'FixedSingle' }
     $f.ClientSize = New-Object Drawing.Size($w, $h)
     if ($Dark) { $f.Add_HandleCreated({ [MgUi]::DarkTitle($this.Handle) }) }
+    $f.Add_Shown({ if (-not [Hotkey]::IsWindowVisible($this.Handle)) { Log "$($this.Text): forced visible"; [void][Hotkey]::ShowWindow($this.Handle, 5) } })
     $f
 }
 # The part of a window above its buttons. It gets a scroll bar when the screen is too small,
@@ -615,7 +622,11 @@ $OpenBtn  = Add-Button $D 'Open download folder' ($D.ClientSize.Width - $M - $op
 $ShowBtn.Anchor = $ClearBtn.Anchor = 'Bottom,Left'; $OpenBtn.Anchor = 'Bottom,Right'
 $D.Add_FormClosing({ if ($_.CloseReason -eq 'UserClosing') { $_.Cancel = $true; $D.Hide() } })
 
-function Show-Downloads { $D.Show(); $D.WindowState = 'Normal'; $D.Activate() }
+function Show-Downloads {
+    $D.Show(); $D.WindowState = 'Normal'
+    if (-not [Hotkey]::IsWindowVisible($D.Handle)) { [void][Hotkey]::ShowWindow($D.Handle, 5) }
+    $D.Activate()
+}
 function Add-Entry($e) {
     $e.Item = New-Object Windows.Forms.ListViewItem($e.Name)
     [void]$e.Item.SubItems.Add($e.Status); [void]$e.Item.SubItems.Add($e.Date)
@@ -912,7 +923,10 @@ $Poll.Add_Tick({
 
 # Opens the download window at once, so it is clear the shortcut worked; the rest fills in while it is open
 function Show-Dialog {
-    if ($F.Visible) { $F.Activate(); return }
+    if ($F.Visible) {   # already open: bring it forward (and make sure it really is on screen)
+        if (-not [Hotkey]::IsWindowVisible($F.Handle)) { Log 'Download window was open but not on screen'; [void][Hotkey]::ShowWindow($F.Handle, 5) }
+        $F.Activate(); return
+    }
     $S.Fg = [Hotkey]::GetForegroundWindow()   # the browser, before our window takes its place
     foreach ($k in 'Url', 'Target', 'Kind', 'Name', 'Len', 'SpDur', 'SpTitle', 'SpArtist', 'SpAlbum', 'Started', 'Meta', 'MetaErr', 'Page', 'Found') { $S[$k] = $null }
     foreach ($b in $U.Start, $U.End, $U.Name) { $b.Text = '' }
@@ -1171,7 +1185,8 @@ if ($env:MEDIAGRAB_SELFTEST) {
     Add-Step 'The download window opens at once' 5 {
         if (-not $F.Visible) { return $false }
         $ms = [int]((Get-Date) - $script:Pressed).TotalMilliseconds
-        Check ($ms -lt 2000) "Pressing the shortcut opened the download window after $ms ms (shows '$($U.Title.Text)')"; $true }
+        Check ($ms -lt 2000) "Pressing the shortcut opened the download window after $ms ms (shows '$($U.Title.Text)')"
+        Check ([Hotkey]::IsWindowVisible($F.Handle)) 'The download window is really on screen'; $true }
     Add-Step 'The YouTube link is looked up' 90 {
         if (-not (Wait-Idle)) { return $false }
         Check ($S.Url -eq $YouTubeLink) "The copied YouTube link was used: $($S.Url)"
@@ -1191,6 +1206,11 @@ if ($env:MEDIAGRAB_SELFTEST) {
         Check ($U.Title.Text -eq 'No video or song found') "With no link, the window says: '$($U.Title.Text)' / '$($U.Info.Text)'"
         Save-Shot $F 'download-no-link'; $F.DialogResult = 'Cancel'; $true }
     Add-Step 'The window closes' 5 { -not $F.Visible }
+    Add-Step 'Click "Download copied link" in the tray menu' 5 { Copy-Text $YouTubeLink; $Tray.ContextMenuStrip.Items[0].PerformClick(); $true }
+    Add-Step 'The tray menu item opens the window' 5 {
+        if (-not $F.Visible) { return $false }
+        Check ([Hotkey]::IsWindowVisible($F.Handle)) '"Download copied link" opens the download window (on screen)'; $F.DialogResult = 'Cancel'; $true }
+    Add-Step 'The window closes' 5 { -not $F.Visible }
     Add-Step 'Open Settings' 5 { $script:StepAt++; $script:StepStart = Get-Date; Show-Settings; $true }   # stays open until a later step saves
     Add-Step 'Settings shows the current shortcut' 10 {
         if (-not $script:SettingsUi -or -not $script:SettingsUi.W.Visible) { return $false }
@@ -1206,7 +1226,7 @@ if ($env:MEDIAGRAB_SELFTEST) {
         Check ($C.Hotkey -eq 'Ctrl+Alt+K') "Saved shortcut: $($C.Hotkey)"
         Check ((Get-Content $CfgFile -Raw) -match 'Ctrl\+Alt\+K') 'The new shortcut is in the settings file'; $true }
     Add-Step 'Press the new shortcut Ctrl+Alt+K' 5 { Copy-Text $YouTubeLink; Show-Downloads; Press $CtrlAltK; $true }
-    Add-Step 'The new shortcut opens the window' 5 { if (-not $F.Visible) { return $false }; Check $true 'Ctrl+Alt+K opens the download window'; $F.DialogResult = 'Cancel'; $true }
+    Add-Step 'The new shortcut opens the window' 5 { if (-not $F.Visible) { return $false }; Check ([Hotkey]::IsWindowVisible($F.Handle)) 'Ctrl+Alt+K opens the download window (on screen)'; $F.DialogResult = 'Cancel'; $true }
     Add-Step 'The window closes' 5 { -not $F.Visible }
     Add-Step 'Press the old shortcut Ctrl+Alt+Y' 5 { Show-Downloads; $script:Pressed = Get-Date; Press $CtrlAltY; $true }
     Add-Step 'The old shortcut does nothing now' 5 {
