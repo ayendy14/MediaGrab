@@ -22,6 +22,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Make sure a release is built from the newest code
+        if: github.event_name == 'release'
+        shell: bash
+        run: |
+          git fetch -q origin main
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
+            echo "::error::The tag ${{ github.event.release.tag_name }} points to older code, not the newest version on main, so no exe was attached. Delete this release and its tag, then publish again with a new tag (for example v1.0.2)."
+            exit 1
+          fi
+          version=$(grep -m1 '^.Version = ' src/MediaGrab.ps1 | cut -d"'" -f2)
+          if [ "v$version" != "${{ github.event.release.tag_name }}" ]; then
+            echo "::warning::The release is called ${{ github.event.release.tag_name }}, but the app calls itself $version (shown in Settings)."
+          fi
+
       - uses: actions/setup-go@v5
         with:
           go-version: '1.24'
