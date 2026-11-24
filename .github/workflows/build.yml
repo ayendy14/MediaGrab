@@ -64,21 +64,6 @@ jobs:
           powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File src\MediaGrab.ps1
           exit $LASTEXITCODE
 
-      - name: Share the screenshots and test results on the ci-screenshots branch
-        if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          [ -d selftest ] || exit 0
-          cd selftest
-          find . -type d -name downloads -prune -exec rm -rf {} +
-          git init -q
-          git checkout -q -b ci-screenshots
-          git add -A .
-          git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com commit -qm "Screenshots and test results for ${GITHUB_SHA::7}"
-          git push -qf "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" ci-screenshots
-
       - name: Keep the exe and screenshots
         if: always()
         uses: actions/upload-artifact@v4

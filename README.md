@@ -47,7 +47,7 @@ This produces `MediaGrab.exe` in the repository folder.
 
 ## Automatic build and releases
 
-Every change to `main` is built and tested on Windows by GitHub Actions (`.github/workflows/build.yml`). The test downloads yt-dlp and ffmpeg, tries a download, presses the keyboard shortcut, changes it in Settings, and takes screenshots of every window in light mode and in dark mode at 150% size. The exe and screenshots can be downloaded from the run's page under **Artifacts**; the screenshots and results are also kept on the `ci-screenshots` branch.
+Every change to `main` is built and tested on Windows by GitHub Actions (`.github/workflows/build.yml`). The test downloads yt-dlp and ffmpeg, tries a download, presses the keyboard shortcut, changes it in Settings, and takes screenshots of every window in light mode and in dark mode at 150% size. The exe and screenshots can be downloaded from the run's page under **Artifacts**.
 
 To publish a new version:
 
