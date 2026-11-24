@@ -3,7 +3,7 @@ param([string]$ExePath)
 # Runs from MediaGrab.exe. yt-dlp and ffmpeg are downloaded automatically on first run.
 # Keep this file plain ASCII: Windows PowerShell reads it without a byte-order mark.
 
-$Version = '1.0.0'
+$Version = '1.0.1'
 $App = "$env:LOCALAPPDATA\MediaGrab"
 New-Item $App -ItemType Directory -Force | Out-Null
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
