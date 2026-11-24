@@ -774,9 +774,9 @@ function Start-Download {
     try { New-Item $dir -ItemType Directory -Force -ErrorAction Stop | Out-Null }
     catch { Show-Message "Cannot use the folder '$dir'.`n$($_.Exception.Message)" $F; return }
 
-    try { $run = Start-YtDlp "$type $info $cut --no-playlist --newline --progress-template `"download:P|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s`" -o `"$dir\$out.%(ext)s`" `"$($S.Target)`"" }
+    try { $run = Start-YtDlp "$type $info $cut --no-playlist --newline --progress-template `"download:P|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s`" -o `"$($dir -replace '%', '%%')\$out.%(ext)s`" `"$($S.Target)`"" }
     catch { Show-Message "yt-dlp could not start: $($_.Exception.Message)" $F; return }
-    $e = @{ Name = $(if ($clean) { "$clean.$fmt" } else { $S.Name }); Path = $(if ($clean) { "$dir\$clean.$fmt" }); Dir = $dir; Key = $key
+    $e = @{ Name = $(if ($clean) { "$clean.$fmt" } elseif ($S.Name) { $S.Name } else { $S.Target }); Path = $(if ($clean) { "$dir\$clean.$fmt" }); Dir = $dir; Key = $key
             Date = Get-Date -Format 'yyyy-MM-dd HH:mm'; Status = 'Starting...'; P = $run.P; Err = $run.Err }
     $e.Line = $e.P.StandardOutput.ReadLineAsync()
     Add-Entry $e; [void]$S.Active.Add($e)
@@ -835,7 +835,7 @@ function Get-UrlRead {
 function Start-Lookup($query) {
     try { $run = Start-YtDlp $query }
     catch { Show-Problem 'yt-dlp could not start' $_.Exception.Message; return }
-    $S.Meta = $run.P.StandardOutput.ReadToEndAsync(); $S.MetaErr = $run.Err
+    $S.Meta = $run.P.StandardOutput.ReadToEndAsync(); $S.MetaErr = $run.Err; $S.MetaProc = $run.P; $S.LookStart = Get-Date
     $Poll.Start()
 }
 # Reads title, artist, album, length and cover from a Spotify song page
@@ -864,7 +864,7 @@ function Use-Link($url) {
         $U.Info.Text = 'Reading the song from Spotify...'
         $wc = New-Object Net.WebClient; $wc.Encoding = [Text.Encoding]::UTF8
         $wc.Headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-        $S.Page = $wc.DownloadStringTaskAsync($url)
+        $S.Page = $wc.DownloadStringTaskAsync($url); $S.Wc = $wc; $S.PageStart = Get-Date
         $Poll.Start()
     } else {
         $U.Info.Text = 'Looking up the video...'
@@ -898,7 +898,13 @@ $Load.Add_Tick({
 $Poll = New-Object Windows.Forms.Timer -Property @{ Interval = 250 }
 $Poll.Add_Tick({
     if ($S.Page) {   # Spotify page, downloaded in the background
-        if (-not $S.Page.IsCompleted) { return }
+        if (-not $S.Page.IsCompleted) {
+            if (((Get-Date) - $S.PageStart).TotalSeconds -gt 20) {
+                $S.Wc.CancelAsync(); $S.Page = $null
+                Show-Problem 'Could not read this Spotify song' 'Spotify did not answer. Check your internet connection and try again.'
+            }
+            return
+        }
         $task = $S.Page; $S.Page = $null
         Read-SpotifyPage $(if ($task.Status -eq 'RanToCompletion') { $task.Result })
         if (-not $S.SpTitle) { Show-Problem 'Could not read this Spotify song' 'Check your internet connection and try again.'; return }
@@ -908,7 +914,14 @@ $Poll.Add_Tick({
         Start-Lookup "--flat-playlist -i --playlist-items 1:5 $Fields `"https://music.youtube.com/search?q=$([Uri]::EscapeDataString($q))#songs`" `"ytsearch5:$q`""
         return
     }
-    if (-not ($S.Meta.IsCompleted -and $S.MetaErr.IsCompleted)) { return }
+    if (-not ($S.Meta.IsCompleted -and $S.MetaErr.IsCompleted)) {
+        if ($S.Meta -and ((Get-Date) - $S.LookStart).TotalSeconds -gt 60) {   # yt-dlp is stuck
+            if (-not $S.MetaProc.HasExited) { try { $S.MetaProc.Kill() } catch { $Error.RemoveAt(0) } }
+            $S.Meta = $null
+            Show-Problem $(if ($S.Kind -eq 'youtube') { 'Not available' } else { $U.Title.Text }) 'YouTube did not answer in time. Check your internet connection and try again.' $S.Url
+        }
+        return
+    }
     $Poll.Stop()
     $seen = @{}
     $S.Found = @($S.Meta.Result -split "`r?`n" | Where-Object { $_ } | ForEach-Object {
@@ -945,7 +958,7 @@ function Show-Dialog {
         $F.Activate(); return
     }
     $S.Fg = [Hotkey]::GetForegroundWindow()   # the browser, before our window takes its place
-    foreach ($k in 'Url', 'Target', 'Kind', 'Name', 'Len', 'SpDur', 'SpTitle', 'SpArtist', 'SpAlbum', 'Started', 'Meta', 'MetaErr', 'Page', 'Found') { $S[$k] = $null }
+    foreach ($k in 'Url', 'Target', 'Kind', 'Name', 'Len', 'SpDur', 'SpTitle', 'SpArtist', 'SpAlbum', 'Started', 'Meta', 'MetaErr', 'MetaProc', 'Page', 'Wc', 'Found') { $S[$k] = $null }
     foreach ($b in $U.Start, $U.End, $U.Name) { $b.Text = '' }
     $U.Type.Value = $C.Format
     $U.VQ.Value = $C.VideoQuality
@@ -1164,6 +1177,8 @@ if ($env:MEDIAGRAB_SELFTEST) {
     try { $r = Start-YtDlp '--version'; $r.P.WaitForExit(); Check ($r.P.ExitCode -eq 0) "yt-dlp runs (version $($r.P.StandardOutput.ReadToEnd().Trim()))" }
     catch { Check $false "yt-dlp runs: $($_.Exception.Message)" }
 
+    $noName = Start-Fake 'https://www.youtube.com/watch?v=0000000001x' ''
+    Check ([bool]$noName.Name) "A download started before its title loaded is still listed by name: '$($noName.Name)'"
     $bad = Start-Fake 'https://www.youtube.com/watch?v=0000000000x' 'Selftest broken link'
     Check (Wait-Until { $bad.Status -like 'Failed*' } 120) "A broken link fails with a reason: $($bad.Status)"
     Check ([bool]$bad.Error) 'The failure reason was captured'
