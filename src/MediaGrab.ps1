@@ -531,6 +531,8 @@ function Fit-Page($form, $page, $contentH, $barH) {
 }
 # A message on top of everything (MediaGrab has no main window to show it over)
 function Show-Message($text, $owner) {
+    Log "Message: $text"
+    if ($env:MEDIAGRAB_SELFTEST) { [void]$ErrorLog.Add("Unexpected message: $text"); return }   # nobody there to click OK
     if ($owner) { [void][Windows.Forms.MessageBox]::Show($owner, $text, 'MediaGrab') }
     else { [void][Windows.Forms.MessageBox]::Show($text, 'MediaGrab', 'OK', 'Information', 'Button1', 'DefaultDesktopOnly') }
 }
@@ -554,33 +556,41 @@ function Set-Hotkey($text) {
 }
 
 # ========== Setup: download yt-dlp + ffmpeg the first time, then only check yt-dlp for updates ==========
-function Start-Setup {
-    $S.FirstRun = -not (Test-Tools); $S.SetupError = $null; $S.SetupStart = Get-Date
-    Log "Setup started ($(if ($S.FirstRun) { 'downloading yt-dlp and ffmpeg' } else { 'checking yt-dlp for updates' }))"
-    $S.Setup = Start-Job -ArgumentList $Bin -ScriptBlock {
-        param($bin)
-        $ErrorActionPreference = 'Stop'
+# Runs on a background thread inside MediaGrab (no second PowerShell process, which does not work
+# when MediaGrab runs without a console window). Every step has a time limit, so it can never hang.
+$SetupScript = {
+    param($bin)
+    $ErrorActionPreference = 'Stop'
+    try {
         [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
         New-Item $bin -ItemType Directory -Force | Out-Null
-        $web = New-Object Net.WebClient
-        # Saves under a temporary name first, so a cut-off download never looks finished
+        # Saves under a temporary name first, so a cut-off download never looks finished; gives up if the connection stalls
         function Get-File($url, $dest) {
-            Remove-Item "$dest.part" -Force -ErrorAction SilentlyContinue
-            $web.DownloadFile($url, "$dest.part")
+            $req = [Net.HttpWebRequest]::Create($url); $req.Timeout = 30000; $req.ReadWriteTimeout = 60000; $req.UserAgent = 'MediaGrab'
+            $res = $req.GetResponse()
+            try {
+                $in = $res.GetResponseStream(); $out = [IO.File]::Create("$dest.part")
+                try { $in.CopyTo($out) } finally { $out.Dispose(); $in.Dispose() }
+            } finally { $res.Dispose() }
             Move-Item "$dest.part" $dest -Force
         }
-        # Runs a program without a window; returns its exit code (-1 if it cannot run at all)
-        function Invoke-Hidden($exe, $arg) {
-            try { (Start-Process $exe $arg -WindowStyle Hidden -Wait -PassThru).ExitCode } catch { -1 }
+        # Runs a program without a window, waiting at most $seconds; returns its exit code (-1 if it cannot run or takes too long)
+        function Invoke-Hidden($exe, $arg, $seconds) {
+            try {
+                $psi = New-Object Diagnostics.ProcessStartInfo $exe, $arg -Property @{ UseShellExecute = $false; CreateNoWindow = $true; RedirectStandardOutput = $true; RedirectStandardError = $true }
+                $p = [Diagnostics.Process]::Start($psi)
+                [void]$p.StandardOutput.ReadToEndAsync(); [void]$p.StandardError.ReadToEndAsync()
+                if ($p.WaitForExit($seconds * 1000)) { $p.ExitCode } else { try { $p.Kill() } catch { }; -1 }
+            } catch { -1 }
         }
 
         $yt = "$bin\yt-dlp.exe"
-        # Update check; if that fails, see whether yt-dlp runs at all (it also fails when offline)
-        if ((Test-Path $yt) -and (Invoke-Hidden $yt '-U') -ne 0 -and (Invoke-Hidden $yt '--version') -ne 0) { Remove-Item $yt -Force }   # damaged: get a fresh copy
+        # Update check; if that fails, see whether yt-dlp runs at all (the update check also fails when offline)
+        if ((Test-Path $yt) -and (Invoke-Hidden $yt '-U' 90) -ne 0 -and (Invoke-Hidden $yt '--version' 30) -ne 0) { Remove-Item $yt -Force }   # damaged: get a fresh copy
         if (-not (Test-Path $yt)) { Get-File 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe' $yt }
 
         $ok = $true
-        foreach ($n in 'ffmpeg', 'ffprobe') { if (-not (Test-Path "$bin\$n.exe") -or (Invoke-Hidden "$bin\$n.exe" '-version') -ne 0) { $ok = $false } }
+        foreach ($n in 'ffmpeg', 'ffprobe') { if (-not (Test-Path "$bin\$n.exe") -or (Invoke-Hidden "$bin\$n.exe" '-version' 30) -ne 0) { $ok = $false } }
         if (-not $ok) {
             Add-Type -AssemblyName System.IO.Compression.FileSystem
             Get-File 'https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip' "$bin\ffmpeg.zip"
@@ -594,7 +604,14 @@ function Start-Setup {
                 }
             } finally { $zip.Dispose(); Remove-Item "$bin\ffmpeg.zip" -Force -ErrorAction SilentlyContinue }
         }
-    }
+        'ready'
+    } catch { "failed: $($_.Exception.Message)" }
+}
+function Start-Setup {
+    $S.FirstRun = -not (Test-Tools); $S.SetupError = $null; $S.SetupStart = Get-Date
+    Log "Setup started ($(if ($S.FirstRun) { 'downloading yt-dlp and ffmpeg' } else { 'checking yt-dlp for updates' }))"
+    $ps = [PowerShell]::Create().AddScript($SetupScript.ToString()).AddArgument($Bin)
+    $S.Setup = @{ PS = $ps; Result = $ps.BeginInvoke() }
 }
 Start-Setup
 
@@ -742,7 +759,7 @@ function Start-Download {
 
     $key = if ($S.Kind -eq 'spotify') { $S.Url -replace '\?.*' } else { $S.Target -replace '&.*' }
     $dup = Get-Entries | Where-Object { $_.Key -eq $key -and $_.Status -eq 'Done' } | Select-Object -First 1
-    if ($dup -and [Windows.Forms.MessageBox]::Show($F, "You already downloaded this on $($dup.Date):`n$($dup.Name)`n`nDownload it again?", 'MediaGrab', 'YesNo') -ne 'Yes') { return }
+    if ($dup -and -not $env:MEDIAGRAB_SELFTEST -and [Windows.Forms.MessageBox]::Show($F, "You already downloaded this on $($dup.Date):`n$($dup.Name)`n`nDownload it again?", 'MediaGrab', 'YesNo') -ne 'Yes') { return }
 
     $fmt   = $U.Type.Value
     $sort  = if ($U.VQ.Value -eq 'Best') { 'ext:mp4:m4a' } else { "res:$($U.VQ.Value -replace 'p'),ext:mp4:m4a" }
@@ -1033,8 +1050,11 @@ $Tick = New-Object Windows.Forms.Timer -Property @{ Interval = 500 }
 $Tick.Add_Tick({
     if ($QuitEvent.WaitOne(0)) { Log 'A newer copy of MediaGrab started'; Quit-App; return }
     Flush-Errors
-    if ($S.Setup -and $S.Setup.State -notin 'Running', 'NotStarted') {
-        $why = $S.Setup.ChildJobs[0].JobStateInfo.Reason.Message
+    if ($S.Setup -and $S.Setup.Result.IsCompleted) {
+        $out = ''
+        try { $out = "$(@($S.Setup.PS.EndInvoke($S.Setup.Result))[-1])" } catch { $out = "failed: $($_.Exception.Message)"; $Error.RemoveAt(0) }
+        try { $S.Setup.PS.Dispose() } catch { }
+        $why = if ($out -like 'failed:*') { $out.Substring(8) } elseif ($out -ne 'ready') { 'no answer' }
         $ok = Test-Tools
         Log "Setup finished after $([int]((Get-Date) - $S.SetupStart).TotalSeconds) s: $(if ($ok) { 'ready' } else { "failed ($why)" })"
         if (-not $ok) {
@@ -1042,7 +1062,7 @@ $Tick.Add_Tick({
             if (-not $F.Visible) { Notify 'Setup failed' "Could not download yt-dlp / ffmpeg ($($S.SetupError)). MediaGrab tries again when you press $($C.Hotkey)." }
         }
         elseif ($S.FirstRun -and -not $F.Visible) { Notify 'MediaGrab is ready' "Press $($C.Hotkey) on a YouTube or Spotify tab." }
-        Remove-Job $S.Setup -Force; $S.Setup = $null
+        $S.Setup = $null
     }
     foreach ($e in @($S.Active)) {
         while ($e.Line.IsCompleted) {
@@ -1141,8 +1161,8 @@ if ($env:MEDIAGRAB_SELFTEST) {
     Check ((Set-Hotkey 'Ctrl+Shift+1') -and -not (Set-Hotkey 'Shift+K') -and -not (Set-Hotkey 'K') -and (Set-Hotkey $C.Hotkey)) 'Shortcuts with numbers work; ones without Ctrl, Alt or Win are refused'
     Check (Wait-Until { -not $S.Setup } 240) 'Setup finished within 4 minutes'
     Check (Test-Tools) 'yt-dlp, ffmpeg and ffprobe are installed'
-    $r = Start-YtDlp '--version'; $r.P.WaitForExit()
-    Check ($r.P.ExitCode -eq 0) "yt-dlp runs (version $($r.P.StandardOutput.ReadToEnd().Trim()))"
+    try { $r = Start-YtDlp '--version'; $r.P.WaitForExit(); Check ($r.P.ExitCode -eq 0) "yt-dlp runs (version $($r.P.StandardOutput.ReadToEnd().Trim()))" }
+    catch { Check $false "yt-dlp runs: $($_.Exception.Message)" }
 
     $bad = Start-Fake 'https://www.youtube.com/watch?v=0000000000x' 'Selftest broken link'
     Check (Wait-Until { $bad.Status -like 'Failed*' } 120) "A broken link fails with a reason: $($bad.Status)"
