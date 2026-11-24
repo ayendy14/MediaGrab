@@ -12,6 +12,9 @@ import (
 //go:embed MediaGrab.ps1
 var script []byte
 
+//go:embed MediaGrab.ico
+var icon []byte // also built into this exe (rsrc_windows_amd64.syso); the app uses this copy for the tray and its windows
+
 func main() {
 	dir := filepath.Join(os.Getenv("LOCALAPPDATA"), "MediaGrab")
 	os.MkdirAll(dir, 0o755)
@@ -19,6 +22,7 @@ func main() {
 	if err := os.WriteFile(ps1, script, 0o644); err != nil {
 		return
 	}
+	os.WriteFile(filepath.Join(dir, "MediaGrab.ico"), icon, 0o644)
 	exe, _ := os.Executable()
 	cmd := exec.Command("powershell.exe", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File", ps1, "-ExePath", exe)
 	// No console window (CREATE_NO_WINDOW). Do not also ask for a hidden start: Windows would then

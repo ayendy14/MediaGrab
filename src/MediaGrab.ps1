@@ -66,7 +66,6 @@ public static class MgUi {
     [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)] static extern int SetWindowTheme(IntPtr h, string app, string id);
     public static void DarkTitle(IntPtr h) { int on = 1; if (DwmSetWindowAttribute(h, 20, ref on, 4) != 0) DwmSetWindowAttribute(h, 19, ref on, 4); }
     public static void DarkScroll(IntPtr h) { SetWindowTheme(h, "DarkMode_Explorer", null); }
-    public static void DarkCombo(IntPtr h) { SetWindowTheme(h, "DarkMode_CFD", null); }
     public static GraphicsPath Round(RectangleF r, float radius) {
         GraphicsPath p = new GraphicsPath();
         float d = Math.Min(radius * 2, Math.Min(r.Width, r.Height));
@@ -214,6 +213,41 @@ public class MgSegments : Control {
             if (!Enabled) tc = MgUi.Mix(tc, Track, 0.55);
             TextRenderer.DrawText(g, items[i], Font, Rectangle.Round(r), tc, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
         }
+    }
+}
+
+// Shows the chosen item over several lines; clicking it opens a list (used for the YouTube match)
+public class MgPicker : Control {
+    bool over;
+    const TextFormatFlags Flags = TextFormatFlags.WordBreak | TextFormatFlags.EndEllipsis | TextFormatFlags.TextBoxControl | TextFormatFlags.NoPrefix;
+    public Color Border { get; set; }
+    public Color Fill { get; set; }
+    public Color HoverFill { get; set; }
+    public Color Arrow { get; set; }
+    public MgPicker() {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        SetStyle(ControlStyles.Selectable, false); TabStop = false; Cursor = Cursors.Hand;
+        Border = Color.Silver; Fill = Color.White; HoverFill = Color.WhiteSmoke; Arrow = Color.Gray;
+    }
+    Rectangle TextArea() { int l = MgUi.Px(10), r = MgUi.Px(30); return new Rectangle(l, MgUi.Px(4), Math.Max(10, Width - l - r), Math.Max(10, Height - MgUi.Px(8))); }
+    public bool TextFits() {   // the whole text is visible (used by the self-test)
+        Rectangle tr = TextArea();
+        return TextRenderer.MeasureText(Text ?? "", Font, new Size(tr.Width, int.MaxValue), Flags).Height <= tr.Height;
+    }
+    protected override void OnTextChanged(EventArgs e) { Invalidate(); base.OnTextChanged(e); }
+    protected override void OnMouseEnter(EventArgs e) { over = true; Invalidate(); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { over = false; Invalidate(); base.OnMouseLeave(e); }
+    protected override void OnPaint(PaintEventArgs e) {
+        Graphics g = e.Graphics; g.Clear(MgUi.Under(this)); g.SmoothingMode = SmoothingMode.AntiAlias;
+        using (GraphicsPath p = MgUi.Round(new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f), MgUi.S(7)))
+        using (SolidBrush b = new SolidBrush(over ? HoverFill : Fill))
+        using (Pen pen = new Pen(Border, MgUi.S(1))) { g.FillPath(b, p); g.DrawPath(pen, p); }
+        float ax = Width - MgUi.S(17), ay = Height / 2f, s = MgUi.S(4.5f);   // small arrow on the right
+        using (SolidBrush b = new SolidBrush(Arrow))
+            g.FillPolygon(b, new PointF[] { new PointF(ax - s, ay - s / 2), new PointF(ax + s, ay - s / 2), new PointF(ax, ay + s / 2 + 1) });
+        Rectangle tr = TextArea();
+        int h = Math.Min(TextRenderer.MeasureText(Text ?? "", Font, new Size(tr.Width, int.MaxValue), Flags).Height, tr.Height);
+        TextRenderer.DrawText(g, Text ?? "", Font, new Rectangle(tr.X, tr.Y + (tr.Height - h) / 2, tr.Width, h), ForeColor, Flags);
     }
 }
 
@@ -693,12 +727,16 @@ $U.Title = Add-Ctl $FP Label @{ Location = New-Object Drawing.Point($HX, ($M - (
 $U.Info  = Add-Ctl $FP Label @{ Location = New-Object Drawing.Point($HX, ($U.Title.Bottom + (Px 2))); Size = New-Object Drawing.Size($HW, ($Fonts.Base.Height + (Px 4)))
     AutoEllipsis = $true; ForeColor = $T.Sub; UseMnemonic = $false }
 $y = $U.Info.Bottom + (Px 4)
-$U.Match = Add-Ctl $FP ComboBox @{ Location = New-Object Drawing.Point($HX, $y); Width = $HW; DropDownStyle = 'DropDownList'; Font = $Fonts.Base }
-if ($Dark) { $U.Match.BackColor = $T.Field; $U.Match.ForeColor = $T.Text; $U.Match.Add_HandleCreated({ [MgUi]::DarkCombo($this.Handle) }) }
+# Spotify: the YouTube video that will be downloaded, in full (up to three lines); click it to pick another
+$U.Pick  = Add-Ctl $FP MgPicker @{ Location = New-Object Drawing.Point($HX, $y); Size = New-Object Drawing.Size($HW, ($Fonts.Base.Height * 3 + (Px 12)))
+    Border = $T.Border; Fill = $T.Field; HoverFill = $T.Sel; Arrow = $T.Sub; ForeColor = $T.Text; Font = $Fonts.Base; Visible = $false }
+$PickMenu = New-Object Windows.Forms.ContextMenuStrip -Property @{ Font = $Fonts.Base; ShowCheckMargin = $true; ShowImageMargin = $false }
+if ($Dark) { $PickMenu.RenderMode = 'System'; $PickMenu.BackColor = $T.Card; $PickMenu.ForeColor = $T.Text }
+$U.Pick.Add_Click({ $PickMenu.Show($U.Pick, (New-Object Drawing.Point(0, $U.Pick.Height))) })
 $U.Url   = Add-Ctl $FP Label @{ Location = New-Object Drawing.Point($HX, $y); Size = New-Object Drawing.Size($HW, ($Fonts.Url.Height + (Px 4)))
     AutoEllipsis = $true; ForeColor = $T.Faint; Font = $Fonts.Url; UseMnemonic = $false }
 $InfoH = $U.Info.Height; $UrlTop = $U.Url.Top
-$y = [math]::Max(($M + $thumbH), $U.Match.Bottom) + (Px 16)
+$y = [math]::Max(($M + $thumbH), $U.Pick.Bottom) + (Px 16)
 [void](Add-Ctl $FP Panel @{ Location = New-Object Drawing.Point($M, $y); Size = New-Object Drawing.Size(($FW - 2 * $M), 1); BackColor = $T.Line })
 $y += Px 16
 $rowY = @{}
@@ -742,7 +780,14 @@ function Pick-Folder($box, $owner) {
 $Browse.Add_Click({ Pick-Folder $U.Dir $F })
 
 function Use-Match($m) { $S.Target = "https://www.youtube.com/watch?v=$($m.Id)"; $S.Len = Format-Len $m.Dur; Set-Hints }
-$U.Match.Add_SelectedIndexChanged({ if ($U.Match.SelectedIndex -ge 0) { Use-Match $S.Found[$U.Match.SelectedIndex] } })
+function Match-Text($m) { "$($m.Title)  ($(Format-Len $m.Dur))" }
+# Spotify: picks one of the YouTube results (shown in the match box, ticked in its list)
+function Select-Match($i) {
+    $m = $S.Found[$i]
+    $U.Pick.Text = Match-Text $m
+    foreach ($it in $PickMenu.Items) { $it.Checked = $it.Tag -eq $i }
+    Use-Match $m
+}
 
 # Sets a tag inside the file (used for Spotify title / artist / album)
 function Meta-Arg($field, $value) {
@@ -796,7 +841,7 @@ function Show-Problem($title, $text, $hint = '', [switch]$Calm) {
     Log "Download window: $title - $text $hint"
     $U.Title.Text = $title; $U.Info.Text = $text; $U.Info.ForeColor = $(if ($Calm) { $T.Sub } else { $T.Bad })
     $U.Info.Height = $Fonts.Base.Height * 2 + (Px 4); $U.Url.Top = $U.Info.Bottom + (Px 2)   # room for two lines
-    $U.Url.Text = $hint; $U.Url.Visible = $true; $U.Match.Visible = $false; $U.Go.Enabled = $false
+    $U.Url.Text = $hint; $U.Url.Visible = $true; $U.Pick.Visible = $false; $U.Go.Enabled = $false
 }
 
 # Reads the address bar of the browser window that was in front, on a background thread
@@ -937,10 +982,13 @@ $Poll.Add_Tick({
     if (-not $best) { $best = $S.Found | Sort-Object Diff | Select-Object -First 1 }
     if ($S.Kind -eq 'spotify') {
         $U.Info.Text = "Spotify $(Format-Len $S.SpDur)$($Dot)YouTube match:"
-        $U.Url.Visible = $false; $U.Match.Visible = $true
-        $U.Match.Items.Clear()
-        foreach ($m in $S.Found) { [void]$U.Match.Items.Add("$($m.Title)  ($(Format-Len $m.Dur))") }
-        $U.Match.SelectedIndex = @(0..($S.Found.Count - 1) | Where-Object { $S.Found[$_].Id -eq $best.Id })[0]
+        $U.Url.Visible = $false; $U.Pick.Visible = $true
+        $PickMenu.Items.Clear()
+        for ($i = 0; $i -lt $S.Found.Count; $i++) {
+            $it = $PickMenu.Items.Add((Match-Text $S.Found[$i])); $it.Tag = $i
+            $it.Add_Click({ Select-Match $this.Tag })
+        }
+        Select-Match (@(0..($S.Found.Count - 1) | Where-Object { $S.Found[$_].Id -eq $best.Id })[0])
         $U.Go.Enabled = $true
     } else {
         $S.Name = $U.Title.Text = $best.Title
@@ -965,7 +1013,7 @@ function Show-Dialog {
     $U.Pic.ClearImage()
     $U.Title.Text = 'Loading...'; $U.Info.Text = 'Reading the link from your browser...'; $U.Info.ForeColor = $T.Sub
     $U.Info.Height = $InfoH; $U.Url.Top = $UrlTop
-    $U.Url.Text = ''; $U.Url.Visible = $true; $U.Match.Items.Clear(); $U.Match.Visible = $false
+    $U.Url.Text = ''; $U.Url.Visible = $true; $PickMenu.Items.Clear(); $U.Pick.Text = ''; $U.Pick.Visible = $false
     $U.Go.Fill = $T.Primary; $U.Go.Hover = $T.PrimaryHover; $U.Go.Enabled = $false
     $S.Stage = 'setup'
     $Load.Start()
@@ -986,7 +1034,7 @@ function Show-Settings {
     $CW = [math]::Max((Px 320), [math]::Max((SegW $Choices.Format), (SegW $Choices.VideoQuality)))
     $X0 = $M + $LW; $SW = $X0 + $CW + $M
     $W = New-Window 'MediaGrab - Settings' $SW (Px 600)
-    $W.TopMost = $true; $W.Icon = $Tray.Icon
+    $W.TopMost = $true; $W.Icon = $AppIcon
     $P = New-Page $W $SW
     $box = @{}; $y = Px 8
     foreach ($r in $rows) {
@@ -1044,13 +1092,22 @@ function Show-Settings {
 }
 
 # ===================== Tray icon and background work =====================
-$bmp = New-Object Drawing.Bitmap 32, 32; $g = [Drawing.Graphics]::FromImage($bmp); $g.SmoothingMode = 'AntiAlias'
-$g.FillEllipse((New-Object Drawing.SolidBrush $T.YouTube), 1, 1, 30, 30)
-$g.FillPolygon([Drawing.Brushes]::White, [Drawing.Point[]]@('13,6', '19,6', '19,14', '24,14', '16,22', '8,14', '13,14'))
-$g.FillRectangle([Drawing.Brushes]::White, 9, 24, 14, 3)
-$Tray = New-Object Windows.Forms.NotifyIcon -Property @{ Visible = $true; Text = 'MediaGrab'; ContextMenuStrip = New-Object Windows.Forms.ContextMenuStrip; Icon = [Drawing.Icon]::FromHandle($bmp.GetHicon()) }
+# MediaGrab.exe puts its icon next to this script; if it is missing (e.g. started directly), draw a simple one
+$IconFile = "$App\MediaGrab.ico"; $AppIcon = $null; $TrayIcon = $null
+if (Test-Path $IconFile) {
+    try { $AppIcon = New-Object Drawing.Icon($IconFile); $TrayIcon = New-Object Drawing.Icon($IconFile, [Windows.Forms.SystemInformation]::SmallIconSize) }
+    catch { Log "Icon could not be loaded: $_"; $Error.RemoveAt(0); $AppIcon = $TrayIcon = $null }
+}
+if (-not $TrayIcon) {
+    $bmp = New-Object Drawing.Bitmap 32, 32; $g = [Drawing.Graphics]::FromImage($bmp); $g.SmoothingMode = 'AntiAlias'
+    $g.FillEllipse((New-Object Drawing.SolidBrush $T.YouTube), 1, 1, 30, 30)
+    $g.FillPolygon([Drawing.Brushes]::White, [Drawing.Point[]]@('13,6', '19,6', '19,14', '24,14', '16,22', '8,14', '13,14'))
+    $g.FillRectangle([Drawing.Brushes]::White, 9, 24, 14, 3)
+    $AppIcon = $TrayIcon = [Drawing.Icon]::FromHandle($bmp.GetHicon())
+}
+$Tray = New-Object Windows.Forms.NotifyIcon -Property @{ Visible = $true; Text = 'MediaGrab'; ContextMenuStrip = New-Object Windows.Forms.ContextMenuStrip; Icon = $TrayIcon }
 $Tray.ContextMenuStrip.Font = $Fonts.Base
-$D.Icon = $Tray.Icon; $F.Icon = $Tray.Icon
+$D.Icon = $AppIcon; $F.Icon = $AppIcon
 function Quit-App { Log 'Closing'; $Tray.Visible = $false; [Windows.Forms.Application]::Exit() }
 foreach ($m in ('Download copied link', { Show-Dialog }), ('Downloads', { Show-Downloads }), ('Settings', { Show-Settings }), ('Open download folder', { Open-Dir $C.SaveDir }), ('Exit', { Quit-App })) {
     [void]$Tray.ContextMenuStrip.Items.Add($m[0], $null, $m[1])
@@ -1171,6 +1228,7 @@ if ($env:MEDIAGRAB_SELFTEST) {
 
     $C.SaveDir = "$Out\downloads"
     Check $HotkeyOk "Keyboard shortcut $($C.Hotkey) turned on at start"
+    if ($ExePath) { Check ((Test-Path $IconFile) -and $TrayIcon.Width -eq [Windows.Forms.SystemInformation]::SmallIconSize.Width) "MediaGrab's icon is used (tray icon $($TrayIcon.Width) px)" }
     Check ((Set-Hotkey 'Ctrl+Shift+1') -and -not (Set-Hotkey 'Shift+K') -and -not (Set-Hotkey 'K') -and (Set-Hotkey $C.Hotkey)) 'Shortcuts with numbers work; ones without Ctrl, Alt or Win are refused'
     Check (Wait-Until { -not $S.Setup } 240) 'Setup finished within 4 minutes'
     Check (Test-Tools) 'yt-dlp, ffmpeg and ffprobe are installed'
@@ -1192,7 +1250,7 @@ if ($env:MEDIAGRAB_SELFTEST) {
     Add-Entry $demo; Set-Status $demo "42.5%$($Dot)3.10MiB/s$($Dot)00:12 left" '42.5'
     Save-Shot $D 'downloads'
     $U.Title.Text = 'Example Artist - Example Song (Official Video)'; $U.Info.Text = "YouTube$($Dot)3:45"; $U.Url.Text = 'https://www.youtube.com/watch?v=example'
-    $U.Type.Value = 'mp4'; $U.VQ.Value = 'Best'; $U.Go.Fill = $T.YouTube; $U.Go.Hover = $T.YouTubeHover; $U.Go.Enabled = $true; $U.Match.Visible = $false; $U.Url.Visible = $true
+    $U.Type.Value = 'mp4'; $U.VQ.Value = 'Best'; $U.Go.Fill = $T.YouTube; $U.Go.Hover = $T.YouTubeHover; $U.Go.Enabled = $true; $U.Pick.Visible = $false; $U.Url.Visible = $true
     Set-Hints; Save-Shot $F 'download-sample'; $F.Hide()
 
     # Then use MediaGrab like a person: press the shortcut, change it in Settings, press the new one.
@@ -1235,6 +1293,17 @@ if ($env:MEDIAGRAB_SELFTEST) {
         if (-not $F.Visible -or -not (Wait-Idle)) { return $false }
         Check ($S.Kind -eq 'spotify') "The copied Spotify link was used: $($S.Url)"
         Note ([bool]$S.SpTitle) "Spotify details: '$($U.Title.Text)' / '$($U.Info.Text)'"
+        if ($S.Found) {
+            Check ($U.Pick.Visible -and $U.Pick.TextFits()) "The YouTube match is shown in full: '$($U.Pick.Text)'"
+            $U.Pick.Text = 'Rick Astley - Never Gonna Give You Up (Official Music Video) [4K Remaster] - From the album Whenever You Need Somebody  (3:34)'
+            Check $U.Pick.TextFits() 'A long YouTube title (about 110 letters) fits in the match box'
+            Select-Match 0
+            if ($S.Found.Count -gt 1) {
+                $PickMenu.Items[1].PerformClick()
+                Check ($S.Target -like "*$($S.Found[1].Id)" -and $PickMenu.Items[1].Checked) "Picking another match from the list switches to it: $($S.Target)"
+                Select-Match 0
+            }
+        }
         Save-Shot $F 'download-spotify'; $F.DialogResult = 'Cancel'; $true }
     Add-Step 'The window closes' 5 { -not $F.Visible }
     Add-Step 'Press Ctrl+Alt+Y with nothing useful copied' 5 { Copy-Text 'hello'; Show-Downloads; Press $CtrlAltY; $true }
