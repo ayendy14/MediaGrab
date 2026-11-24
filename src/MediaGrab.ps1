@@ -1228,7 +1228,8 @@ if ($env:MEDIAGRAB_SELFTEST) {
         Check ($U.Title.Text -eq 'No video or song found') "With no link, the window says: '$($U.Title.Text)' / '$($U.Info.Text)'"
         Save-Shot $F 'download-no-link'; $F.DialogResult = 'Cancel'; $true }
     Add-Step 'The window closes' 5 { -not $F.Visible }
-    Add-Step 'Click "Download copied link" in the tray menu' 5 { Copy-Text $YouTubeLink; $Tray.ContextMenuStrip.Items[0].PerformClick(); $true }
+    # the click opens the window and waits until it closes, so move on to the next step first
+    Add-Step 'Click "Download copied link" in the tray menu' 5 { Copy-Text $YouTubeLink; $script:StepAt++; $script:StepStart = Get-Date; $Tray.ContextMenuStrip.Items[0].PerformClick(); $true }
     Add-Step 'The tray menu item opens the window' 5 {
         if (-not $F.Visible) { return $false }
         Check ([Hotkey]::IsWindowVisible($F.Handle)) '"Download copied link" opens the download window (on screen)'; $F.DialogResult = 'Cancel'; $true }
