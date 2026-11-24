@@ -1087,8 +1087,9 @@ elseif ($HotkeyOk) { Notify 'MediaGrab is running' "Press $($C.Hotkey) on a YouT
 if ($env:MEDIAGRAB_SELFTEST) {
     $Out = $env:MEDIAGRAB_SELFTEST
     $Log = [Collections.ArrayList]@(); $Fails = 0
-    function Check($ok, $what) { [void]$Log.Add("$(if ($ok) { 'PASS' } else { 'FAIL' })  $what"); if (-not $ok) { $script:Fails++ } }
-    function Note($ok, $what) { [void]$Log.Add("$(if ($ok) { 'PASS' } else { 'WARN' })  $what") }   # depends on YouTube / Spotify, so only a warning
+    function Check($ok, $what) { $line = "$(if ($ok) { 'PASS' } else { 'FAIL' })  $what"; [void]$Log.Add($line); Log "TEST $line"; if (-not $ok) { $script:Fails++ } }
+    function Note($ok, $what) { $line = "$(if ($ok) { 'PASS' } else { 'WARN' })  $what"; [void]$Log.Add($line); Log "TEST $line" }   # depends on YouTube / Spotify, so only a warning
+    Log "TEST self-test started (launched by $(if ($ExePath) { 'MediaGrab.exe' } else { 'PowerShell' }))"
     function Wait-Until([scriptblock]$done, $seconds) {
         $end = (Get-Date).AddSeconds($seconds)
         while (-not (& $done) -and (Get-Date) -lt $end) { [Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 50 }
@@ -1138,7 +1139,7 @@ if ($env:MEDIAGRAB_SELFTEST) {
     $C.SaveDir = "$Out\downloads"
     Check $HotkeyOk "Keyboard shortcut $($C.Hotkey) turned on at start"
     Check ((Set-Hotkey 'Ctrl+Shift+1') -and -not (Set-Hotkey 'Shift+K') -and -not (Set-Hotkey 'K') -and (Set-Hotkey $C.Hotkey)) 'Shortcuts with numbers work; ones without Ctrl, Alt or Win are refused'
-    Check (Wait-Until { -not $S.Setup } 600) 'Setup finished within 10 minutes'
+    Check (Wait-Until { -not $S.Setup } 240) 'Setup finished within 4 minutes'
     Check (Test-Tools) 'yt-dlp, ffmpeg and ffprobe are installed'
     $r = Start-YtDlp '--version'; $r.P.WaitForExit()
     Check ($r.P.ExitCode -eq 0) "yt-dlp runs (version $($r.P.StandardOutput.ReadToEnd().Trim()))"
@@ -1170,6 +1171,7 @@ if ($env:MEDIAGRAB_SELFTEST) {
         if ($Running[$i]) { return }   # this step is still busy (e.g. taking a screenshot)
         $Running[$i] = $true
         $st = $Steps[$i]
+        if (-not $Running.Count -and ((Get-Date) - $script:StepStart).TotalMilliseconds -lt 200) { Log "TEST step: $($st.Name)" }
         try { $done = [bool](& $st.Do) } catch { Check $false "$($st.Name): $_"; $done = $true }
         $Running.Remove($i)
         if (-not $done -and ((Get-Date) - $script:StepStart).TotalSeconds -gt $st.Seconds) {

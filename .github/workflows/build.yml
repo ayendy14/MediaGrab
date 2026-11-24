@@ -46,6 +46,7 @@ jobs:
         run: ./build.sh
 
       - name: Self-test, light mode (started through MediaGrab.exe, like a person does; first start)
+        timeout-minutes: 10
         shell: powershell
         run: |
           $env:MEDIAGRAB_THEME = 'light'
@@ -56,6 +57,8 @@ jobs:
           exit $p.ExitCode
 
       - name: Self-test, dark mode at 150% size (started with Windows' "start hidden"; later start)
+        if: always()
+        timeout-minutes: 10
         shell: powershell
         run: |
           $env:MEDIAGRAB_THEME = 'dark'
@@ -65,6 +68,14 @@ jobs:
           $p = Start-Process powershell.exe '-NoProfile -STA -ExecutionPolicy Bypass -File src\MediaGrab.ps1' -WindowStyle Hidden -PassThru; $null = $p.Handle; $p.WaitForExit()
           Get-Content "$env:MEDIAGRAB_SELFTEST\result.txt" -ErrorAction SilentlyContinue
           exit $p.ExitCode
+
+      - name: Show MediaGrab's log
+        if: always()
+        shell: powershell
+        run: |
+          New-Item selftest -ItemType Directory -Force | Out-Null
+          Copy-Item "$env:LOCALAPPDATA\MediaGrab\log.txt" selftest\app-log.txt -ErrorAction SilentlyContinue
+          Get-Content selftest\app-log.txt -ErrorAction SilentlyContinue
 
       - name: Keep the exe and screenshots
         if: always()
